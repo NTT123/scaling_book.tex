@@ -21,7 +21,6 @@ This is the main command. It automatically:
 
 ### Other Build Commands
 ```bash
-./build.sh chapter 01         # Build chapter 01 only
 ./build.sh clean              # Remove all build artifacts
 ./build.sh --skip-images      # Build without syncing images (faster rebuilds)
 ./build.sh help               # Show help
@@ -82,12 +81,6 @@ This separation keeps source and build artifacts in different locations. Images 
 ## Git Submodule
 
 The original markdown source is at `scaling-book/` as a submodule pointing to https://github.com/jax-ml/scaling-book.git. The build script automatically initializes it if empty, so manual `git submodule update --init` is not required.
-
-## Requirements
-
-- XeLaTeX (from TeX Live or MacTeX)
-- BibTeX (included with TeX distributions)
-- Git (for submodule management)
 
 ## Common Workflows
 

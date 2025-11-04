@@ -5,7 +5,6 @@
 #
 # Commands:
 #   all      - Build complete book (default)
-#   chapter  - Build specific chapter (usage: ./build.sh chapter 01)
 #   clean    - Remove build artifacts
 #   help     - Show this help message
 #
@@ -159,56 +158,6 @@ build_book() {
     fi
 }
 
-# Function to build individual chapter
-build_chapter() {
-    local chapter_num=$1
-
-    if [ -z "$chapter_num" ]; then
-        print_error "Please specify chapter number (e.g., ./build.sh chapter 01)"
-        exit 1
-    fi
-
-    # Get absolute paths
-    local SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    local ABS_BUILD_DIR="$SCRIPT_DIR/$BUILD_DIR"
-    local ABS_SOURCE_DIR="$SCRIPT_DIR/$SOURCE_DIR"
-
-    # Find chapter file
-    local chapter_file="$ABS_SOURCE_DIR/chapters/${chapter_num}-*.tex"
-
-    if ! ls $chapter_file 1> /dev/null 2>&1; then
-        print_error "Chapter file not found: $chapter_file"
-        exit 1
-    fi
-
-    print_info "Building chapter: $chapter_file"
-
-    # Create a temporary wrapper file
-    local temp_file="$ABS_BUILD_DIR/temp-chapter-$chapter_num.tex"
-    mkdir -p "$ABS_BUILD_DIR"
-
-    cat > "$temp_file" << EOF
-\documentclass[10pt,twoside]{book}
-\usepackage{fontsetup}
-\usepackage[b6paper,inner=2cm,outer=0.8cm,top=0cm,bottom=0.3cm,includeheadfoot]{geometry}
-\usepackage{amsmath,amssymb}
-\usepackage{graphicx}
-\usepackage{hyperref}
-\begin{document}
-\include{$chapter_file}
-\end{document}
-EOF
-
-    # Build the chapter
-    cd "$ABS_SOURCE_DIR" && xelatex -output-directory="$ABS_BUILD_DIR" -interaction=nonstopmode "$temp_file"
-
-    local output_pdf="$SCRIPT_DIR/chapter-${chapter_num}.pdf"
-    cp "$ABS_BUILD_DIR/temp-chapter-$chapter_num.pdf" "$output_pdf" 2>/dev/null || true
-
-    cd "$SCRIPT_DIR"
-    print_info "Chapter built: $output_pdf"
-}
-
 # Function to show help
 show_help() {
     cat << EOF
@@ -218,7 +167,6 @@ Usage: ./build.sh [flags] [command]
 
 Commands:
     all      - Build complete book with table of contents (default)
-    chapter  - Build specific chapter (usage: ./build.sh chapter 01)
     clean    - Remove all build artifacts
     help     - Show this help message
 
@@ -229,7 +177,6 @@ Examples:
     ./build.sh                    # Build complete book
     ./build.sh all                # Build complete book
     ./build.sh --skip-images all  # Build without syncing images
-    ./build.sh chapter 01         # Build chapter 01 only
     ./build.sh clean              # Clean build files
 
 Note: Images are automatically synced from the scaling-book submodule.
@@ -255,9 +202,6 @@ done
 case "${1:-all}" in
     all)
         build_book
-        ;;
-    chapter)
-        build_chapter "$2"
         ;;
     clean)
         clean

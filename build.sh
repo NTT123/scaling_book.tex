@@ -45,6 +45,17 @@ clean() {
     print_info "Clean complete."
 }
 
+# Function to initialize git submodule if needed
+init_submodule() {
+    local SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+    # Check if scaling-book submodule is empty
+    if [ -d "$SCRIPT_DIR/scaling-book" ] && [ ! "$(ls -A "$SCRIPT_DIR/scaling-book")" ]; then
+        print_info "Initializing git submodule..."
+        cd "$SCRIPT_DIR" && git submodule update --init --recursive
+    fi
+}
+
 # Function to build complete book
 build_book() {
     print_info "Building complete book: $MAIN_FILE"
@@ -53,6 +64,9 @@ build_book() {
     local SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     local ABS_BUILD_DIR="$SCRIPT_DIR/$BUILD_DIR"
     local ABS_SOURCE_DIR="$SCRIPT_DIR/$SOURCE_DIR"
+
+    # Initialize submodule if needed
+    init_submodule
 
     # Create build directory if it doesn't exist
     mkdir -p "$ABS_BUILD_DIR"

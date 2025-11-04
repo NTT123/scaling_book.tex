@@ -21,9 +21,9 @@ JAX supports three schools of thought for multi-device programming:
 \textbf{Mode} & \textbf{View?} & \textbf{Explicit sharding?} & \textbf{Explicit Collectives?} \\
 \midrule
 \endhead
-Auto & Global & ✗ & ✗ \\
-Explicit & Global & ✓ & ✗ \\
-Manual & Per-device & ✓ & ✓ \\
+Auto & Global & \xmark & \xmark \\
+Explicit & Global & \cmark & \xmark \\
+Manual & Per-device & \cmark & \cmark \\
 \bottomrule
 \end{longtable}
 }

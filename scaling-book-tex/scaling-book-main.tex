@@ -127,6 +127,10 @@
 \newcommand{\VerbatimStringTok}[1]{\textcolor{stringcolor}{#1}}
 \newcommand{\WarningTok}[1]{\textcolor{red}{\textit{#1}}}
 
+% Custom symbols for tables (checkmark and cross mark)
+\newcommand{\xmark}{$\times$}
+\newcommand{\cmark}{$\checkmark$}
+
 % Hyperref for cross-references
 \usepackage[
     colorlinks=true,
@@ -234,19 +238,14 @@ Reiner Pope\textsuperscript{*}\\[1em]
 }
 \maketitle
 % Restore two-sided margins for content
-\thispagestyle{empty}
 \restoregeometry
 
 \newpage
-\thispagestyle{empty}
 \ % The empty page
 \newpage
-\thispagestyle{empty}
 \ % The empty page
-\thispagestyle{empty}
 % Table of contents
-% \tableofcontents
-\thispagestyle{empty}
+\tableofcontents
 
 % Main content - chapters
 \input{chapters/00-introduction}

@@ -1,3 +1,4 @@
+\newpage
 \section{Tricks for Improving Generation Throughput and Latency}
 
 Since the original \href{https://arxiv.org/abs/1706.03762}{Attention is All You Need paper}, many techniques have been developed to make the model more efficient, often targeting the KV cache specifically. Generally speaking, a smaller KV cache makes it easier to increase batch size and context length of the generation step without hurting latency, and makes life easier for the systems surrounding the Transformer (like request caching). Ignoring effects on quality, we may see:

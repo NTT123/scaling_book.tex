@@ -41,6 +41,10 @@ The diagram above also includes a few other components like SMEM and the scalar 
 
 \textbf{Generally, all TPU operations are pipelined and overlapped.} To perform a matmul $X \cdot A \to Y$, a TPU would first need to copy chunks of matrices $A$ and $X$ from HBM into VMEM, then load them into the MXU which multiplies chunks of 8x128 (for $X$) and 128x128 (for $A$), then copy the result chunk by chunk back to HBM. To do this efficiently, the matmul is pipelined so the copies to/from VMEM are overlapped with the MXU work. This allows the MXU to continue working instead of waiting on memory transfers, keeping matmuls compute-bound, not memory-bound.
 
+Here's an example of how you might perform an elementwise product from HBM:
+
+% Note: Animated figure omitted (pointwise-product.gif) - an animation showing a pointwise product performed on TPU, with bytes loaded from HBM. Note how bytes are streamed out of memory in chunks and partial results are pipelined back without waiting for the full array to be materialized.
+
 A matmul would look nearly identical except it would load into the MXU instead of the VPU/Vector unit, and the loads and stores would occur in a different order, since the same weight chunk is used for multiple chunks of activations. You can see chunks of data streaming into VMEM, then into the VREGs (vector registers), then into the Vector Unit, then back into VMEM and HBM. As we're about to see, if the load from HBM to VMEM is slower than the FLOPs in the Vector Unit (or MXU), we become ``bandwidth bound'' since we're starving the VPU or MXU of work.
 
 \begin{takeawaybox}
@@ -73,7 +77,7 @@ TPUs are very simple. They load weights from HBM into VMEM, then from VMEM into 
 \section*{TPU Networking}
 \addcontentsline{toc}{section}{TPU Networking}
 
-\textbf{Chips are connected to each other through the ICI network in a Pod}. In older generations (TPU v2 and TPU v3), inference chips (e.g., TPU v5e), and Trillium (TPU v6e), ICI (``inter-chip interconnects'') connects the 4 nearest neighbors (with edge links to form a 2D torus). TPU v4 and TPU v5p are connected to the nearest 6 neighbors (forming a 3D torus). Note these connections do \textbf{not} go through their hosts, they are direct links between chips.
+\textbf{Chips are connected to each other through the ICI network in a Pod}. In older generations (TPU v2 and TPU v3), inference chips (e.g., TPU v5e), and Trilium (TPU v6e), ICI (``inter-chip interconnects'') connects the 4 nearest neighbors (with edge links to form a 2D torus). TPU v4 and TPU v5p are connected to the nearest 6 neighbors (forming a 3D torus). Note these connections do \textbf{not} go through their hosts, they are direct links between chips.
 
 \begin{figure}[htb]
 \centering
@@ -146,15 +150,15 @@ This means that when we split models across multiple chips, we need to be carefu
 Here are some specific numbers for our chips:
 
 {\scriptsize
-\begin{longtable}{lccccc}
+\begin{longtable}{lcccccc}
 \toprule
-\textbf{Model} & \textbf{\shortstack{Pod \\ size}} & \textbf{\shortstack{Host \\ size}} & \textbf{\shortstack{HBM capacity \\ /chip}} & \textbf{\shortstack{HBM BW/chip \\ (bytes/s)}} & \textbf{\shortstack{FLOPs/s/chip \\ (bf16)}} \\
+\textbf{Model} & \textbf{\shortstack{Pod \\ size}} & \textbf{\shortstack{Host \\ size}} & \textbf{\shortstack{HBM capacity \\ /chip}} & \textbf{\shortstack{HBM BW/chip \\ (bytes/s)}} & \textbf{\shortstack{FLOPs/s/chip \\ (bf16)}} & \textbf{\shortstack{FLOPs/s/chip \\ (int8)}} \\
 \midrule
-TPU v3 & 32x32 & 4x2 & 32GB & 9.0e11 & 1.4e14 \\
-TPU v4p & 16x16x16 & 2x2x1 & 32GB & 1.2e12 & 2.75e14 \\
-TPU v5p & 16x20x28 & 2x2x1 & 96GB & 2.8e12 & 4.59e14 \\
-TPU v5e & 16x16 & 4x2 & 16GB & 8.1e11 & 1.97e14 \\
-TPU v6e & 16x16 & 4x2 & 32GB & 1.6e12 & 9.20e14 \\
+TPU v3 & 32x32 & 4x2 & 32GB & 9.0e11 & 1.4e14 & 1.4e14 \\
+TPU v4p & 16x16x16 & 2x2x1 & 32GB & 1.2e12 & 2.75e14 & 2.75e14 \\
+TPU v5p & 16x20x28 & 2x2x1 & 96GB & 2.8e12 & 4.59e14 & 9.18e14 \\
+TPU v5e & 16x16 & 4x2 & 16GB & 8.1e11 & 1.97e14 & 3.94e14 \\
+TPU v6e & 16x16 & 4x2 & 32GB & 1.6e12 & 9.20e14 & 1.84e15 \\
 \bottomrule
 \end{longtable}
 }
@@ -237,3 +241,40 @@ Cross-lane reductions are much harder and involve a separate hardware unit calle
 The scalar core is the control unit of the TPU. It fetches and dispatches all instructions and executes transfers from HBM into VMEM, and can be programmed to do scalar metadata work. Because the scalar core is single-threaded, one side-effect of this is that each core of the TPU is only capable of creating one DMA request per cycle.
 
 To put this in context, a single scalar core controls a VPU (consisting of 4096 ALUs), 4 MXUs, 2 XLUs, and multiple DMA engines. The highly skewed nature of control per unit compute is a source of hardware efficiency, but also limits the ability to do data dependent vectorization in any interesting way.
+
+\subsection*{Appendix B: How does a systolic array work?}
+\addcontentsline{toc}{subsection}{Appendix B: How does a systolic array work?}
+
+At the core of the TPU MXU is a \texttt{128x128} systolic array (\texttt{256x256} on TPU v6e). When fully saturated the systolic array can perform one \texttt{bfloat16[8,128] @ bf16[128x128] -> f32[8,128]}\footnote{If you are not familiar with this notation, it means: multiplying a \texttt{8x128} matrix with bfloat16 elements by a \texttt{128x128} matrix with bfloat16 elements and storing the results in a \texttt{8x128} matrix with float32 elements.} multiplication per 8 clock cycles.
+
+\begin{itemize}
+\item At its core, the systolic array is a 2D \texttt{128x128} (\texttt{=16,384}) grid of ALUs each capable of performing a multiply and add operation.
+\item Weights (\textbf{W}, the \texttt{128x128} input) are passed down from above (called the RHS) while inputs (\textbf{X}, the \texttt{8x128} input) are passed in from the left (called the LHS).
+\end{itemize}
+
+Here is a simplified animation of multiplying a set of weights (blue) with a set of activations (green). You'll notice that the weights (RHS) are partially loaded first, diagonally, and then the activations are fed in, also diagonally. In each frame below, we multiply all the overlapped green and blue units, sum the result with any residual passed in from above, and then pass the result in turn down one unit.
+
+% Note: Animated GIF figure omitted (systolic-array.gif) - cannot be displayed in print
+
+Here's a more general version of this animation showing the output being streamed out of computation:
+
+% Note: Animated GIF figure omitted (systolic-array2.gif) - cannot be displayed in print
+
+Here's a diagram showing how this can be pipelined across multiple RHS and LHS arrays:
+
+\begin{figure}[htb]
+\centering
+\includegraphics[width=\textwidth]{images/systolic-array-pipelining.png}
+\end{figure}
+
+There is an initial pipeline bubble as the weights (RHS) and activations (LHS) are loaded. After that initial bubble, new inputs and weights can be loaded in without an additional bubble.
+
+Here's a bad animation of a bf16[2, 3] x bf16[3, 3] matrix multiplication, which you could imagine as a matmul of a 2x3 weight matrix with an input activation of batch 1 and size 3. This is rotated compared to the previous slides and inputs flow out to the right instead of down, but you can roughly see the structure.
+
+% Note: Animated GIF figure omitted (systolic-array-bad.gif) - cannot be displayed in print
+
+We can efficiently pipeline this to multiply large matrices without too large a pipeline bubble. With that said, it's important that our matrices have shapes larger than the side dimension of the MXU, which is generally 128x128. Some TPUs (since TPU v3) have multiple MXUs, either 2 for TPU v3 and 4 for TPU v4/5, so we need to ensure tiling dimensions are larger than 128 * number of MXUs. Here's a good animation for this.\footnote{Available at: \url{https://www.youtube.com/watch?v=sJltBQ4MOHA}}
+
+Trillium (TPU v6e) has a \texttt{256x256} systolic array, which means it can perform 4x more FLOPs / cycle. This also means the dimensions of your tensors needs to be twice as large to utilize the MXU fully.
+
+This blog post has another excellent animation of a systolic array multiplication for a fixed weight matrix.\footnote{Available at: \url{https://fleetwood.dev/posts/domain-specific-architectures\#google-tpu}}

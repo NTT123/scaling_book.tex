@@ -1,0 +1,57 @@
+\subsection{Looking at a real(ish) example profile}
+
+An example Colab\footnote{\scriptsize See: \texttt{colab.research.google.com/drive/1\_6krERgtolH7hbUIo7ewAMLlbA4fqEF8}} has an example profile for a fake Transformer.
+
+A Perfetto link\footnote{\scriptsize See: \texttt{ui.perfetto.dev/\#!/?s=fa9f13b487bde622707c1a503f9227c34594760a}} to at least see the Trace Viewer if you're in a hurry.
+
+I've gone to more effort than usual to annotate the trace with \texttt{jax.named\_scope} calls so you can identify what's going on.
+
+\begin{figure}[htb]
+\centering
+\includegraphics[width=\textwidth]{images/transformer-xprof.png}
+\caption{Full profiler trace for a fake Transformer showing repeated layer patterns with attention and feedforward components clearly visible.}
+\label{fig:transformer-xprof}
+\end{figure}
+
+Take a look at the profile and try to really understand what each part is doing. Let's break it down a bit, starting with the FFW block:
+
+\begin{figure}[htb]
+\centering
+\includegraphics[width=\textwidth]{images/transformer-ffw.png}
+\caption{Zoomed view of the feedforward (FFW) block showing the up-projection fusion operation and subsequent operations.}
+\label{fig:transformer-ffw}
+\end{figure}
+
+Here we've zoomed into the FFW block. You'll see the up-projection Op is a fusion (matmul) with inputs \texttt{bf16[8, 1024, 8192]} and \texttt{bf16[8192, 16384]} and output \texttt{bf16[32, 1024, 16384]}. I know (because I wrote this code) that this is a local view of a 4-way DP, 2-way MP sharded matmul, so we're actually doing
+
+\textbf{X:} \texttt{bf16[32, 1024, 8192]} $\times$ \textbf{W$_{\text{in}}$}: \texttt{bf16[8192, 32768]} $\to$ \textbf{Tmp}: \texttt{bf16[32, 1024, 32768]}
+
+\textbf{How long do we expect this to take?} First of all, our batch size per data parallel shard is $8 \times 1024 = 8192$, so we should be solidly compute-bound. This is on 8 TPUv2 cores (freely available on Google Colab), so we expect it to take about $2 \times 32 \times 1024 \times 8192 \times 32768 / (23\text{e}12 \times 8) = 95.6\text{ms}$ which is pretty much exactly how long it takes (96ms). That's great! That means we're getting fantastic FLOPs utilization!
+
+\textbf{What about communication?} You'll notice the little fusion hidden at the end of the second matmul. If we click on it, you'll see
+
+\begin{lstlisting}[language=C, basicstyle=\footnotesize\ttfamily, breaklines=true]
+%fusion.1 = bf16[8,1024,4096]{2,1,0:T(8,128)(2,1)} fusion(bf16[8,1024,8192]{2,1,0:T(8,128)(2,1)} %fusion.31), kind=kCustom, calls=%all-reduce-scatter.1
+\end{lstlisting}
+
+which is basically a little ReduceScatter (here's the GraphViewer):
+
+\begin{figure}[htb]
+\centering
+\includegraphics[width=\textwidth]{images/reduce-scatter-xprof.png}
+\caption{Graph view of the reduce-scatter operation showing how data is aggregated and distributed across TPU cores.}
+\label{fig:reduce-scatter-xprof}
+\end{figure}
+
+How long do we expect this to take? Well, we're doing a ReduceScatter on a TPUv2 4x2, which should require only one hop on 1.2e11 bidirectional bandwidth. The array has size $2 \times 32 \times 1024 \times 8192$ with the batch axis sharded 4 ways, so each shard is $2 \times 8 \times 1024 \times 8192 = 134\text{MB}$. So this should take roughly 1.1ms. \textbf{How long does it actually take?} 1.13ms reported in the profile. So we're really close to the roofline!
+
+\textbf{Let's look at attention too!} Here's a profile of the attention component:
+
+\begin{figure}[htb]
+\centering
+\includegraphics[width=\textwidth]{images/attn-xprof.png}
+\caption{Profile of the attention mechanism showing Q, K, V projections and attention computation operations.}
+\label{fig:attn-xprof}
+\end{figure}
+
+I've clicked on the Q projection op, which uses a matrix $W_Q$ of shape [$d_\text{model}$ = 8192, $n_\text{heads}$ = 32, $d_\text{qkv}$ = 256]. We're Megatron sharding along the head dimension. Try to do the same exercise of calculating how long these should take.

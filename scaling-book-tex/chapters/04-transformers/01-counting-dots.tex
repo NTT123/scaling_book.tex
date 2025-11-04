@@ -3,7 +3,6 @@
 
 Let's start with vectors $x$,$y$ and matrices $A$,$B$ of the following shapes:
 
-$$
 \def \red#1{\textcolor{red}{#1}}
 \def \green#1{\textcolor{green}{#1}}
 \def \blue#1{\textcolor{blue}{#1}}
@@ -11,6 +10,7 @@ $$
 \def \orange#1{\textcolor{orange}{#1}}
 \def \gray#1{\textcolor{gray}{#1}}
 
+$$
 \begin{array}{cc}
 \textrm{array}  & \textrm{shape} \\ \hline
 x               & \textrm{[P]}   \\
@@ -37,12 +37,10 @@ Operation & FLOPs & Data \\
 $x \cdot y$  & $2P$   & $2P$      \\
 $A x$        & $2NP$  & $NP + P$  \\
 $AB$         & $2NPM$ & $NP + PM$ \\
-General einsum & $2 \prod c_i \prod d_j^*$ & $\prod c_i + \prod d_j$ \\
+$[c_0,...,c_N] \cdot [d_0,...,d_N]$ & $2 \prod c_i \times \prod_{\substack{d_j \notin \textcolor{blue}{BATCH} \\ d_j \notin \textcolor{red}{CONTRACT}}} d_j$ & $\prod c_i + \prod d_j$ \\
 \bottomrule
 \end{tabular}
 \end{center}
-
-\noindent\textit{*where $d_j^*$ are non-batch, non-contracting dims of $d$}
 }
 
 Make note of the fact that for a matrix-matrix multiply, the \emph{compute} scales cubically $O(N^3)$ while the data transfer only scales quadratically $O(N^2)$ -- this means that as we scale up our matmul size, it becomes \emph{easier} to hit the compute-saturated limit. This is extremely unusual, and explains in large part why we use architectures dominated by matrix multiplication -- they're amenable to being scaled!

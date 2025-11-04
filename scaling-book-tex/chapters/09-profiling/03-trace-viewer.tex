@@ -1,0 +1,22 @@
+\subsection{Trace Viewer}
+
+\textbf{The Trace Viewer is probably the most useful part of the profiler.} The example below shows a simple Transformer with pieces annotated. Names come from labels provided in the code.
+
+\begin{figure}[htb]
+\centering
+\includegraphics[width=\textwidth]{images/trace-viewer.png}
+\caption{The Trace Viewer showing a chronological timeline of operations for a simple Transformer. The top row shows XLA operations (HLO names), while lower rows show approximate traces from JAX scope annotations.}
+\label{fig:trace-viewer}
+\end{figure}
+
+The Trace Viewer shows a chronological timeline of all the actions on each TPU core. We're only looking at TPU:0 here, since typically all TPUs execute the same instructions. A few key notes:
+
+\begin{enumerate}
+\item The top row (XLA Ops) shows the actual TPU operations (the names are HLO names). Everything else is an approximate trace based on \texttt{jax.named\_scope}, \texttt{jax.named\_call}, and the Python stack trace.
+\item Noting the repeated blocks, we can isolate a single layer here. We can also see (from looking at the code/understanding how a Transformer works) what parts are attention and what parts are MLPs.
+\item By clicking on an XLA op, we can view where in the code it comes from (useful for understanding the trace) and see links to the Graph viewer.
+\end{enumerate}
+
+\begin{takeawaybox}
+\textbf{Tip:} you can navigate the Trace Viewer using ``video game'' style controls, with A/D panning left and right, and W/S zooming in and out. These controls make navigating a lot easier.
+\end{takeawaybox}

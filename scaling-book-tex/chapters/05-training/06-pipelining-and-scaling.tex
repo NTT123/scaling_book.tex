@@ -88,11 +88,11 @@ For TPU v5p, the $\frac{C}{W_\text{dcn}}$ is about \texttt{4.46e14 / 6.25e9 = 71
 \begin{itemize}
     \item We can do Tensor Parallelism up to above $Y = M_Y \cdot F / 2550 \approxeq 11 \cdot M_Y$.
     \item We can do FSDP so long as $B / N > 2550 / M_X$. That means if we want to train with BS=2M and 3~axes of data parallelism, we'd at most be able to use $\approx 2400$ chips, roughly a quarter of a TPU v5p pod.
-    \item When we combine FSDP~+~Tensor Parallelism, become comms-bound when we have $B / N < 2550^2 / 2 * 30,000 = 108$, so this lets us scale to roughly 18k chips! However, the maximum size of a TPU v5p pod is 8k chips, so beyond that we have to use DCN.
+    \item When we combine FSDP~+~Tensor Parallelism, become bandwidth-bound when we have $B / N < 2550^2 / 2 * 30,000 = 108$, so this lets us scale to roughly 18k chips! However, the maximum size of a TPU v5p pod is 8k chips, so beyond that we have to use DCN.
 \end{itemize}
 
 The TLDR is that we have a nice recipe for training with BS=1M, using roughly X~(FSDP)~=~1024 and Y~(TP)~=~8, but with BS=2M we need to use DCN. As noted above, we have a DCN arithmetic intensity of 71,360, so we just need to make sure our batch size per ICI domain is greater than this. This is trivial for us, since with 2~pods we'd have a per-pod BS of 1M, and a per GPU batch size of 111, which is great (maybe cutting it a bit close, but theoretially sound).
 
-\begin{tcolorbox}[takeawaybox]
-Scaling across multiple TPU pods is fairly straightforward using pure data parallelism so long as our per-pod batch size is at least 71k tokens.
-\end{tcolorbox}
+\begin{takeawaybox}
+Scaling across multiple TPU pods is fairly straightforward using pure data parallelism so long as our per-pod token batch size is at least 71k tokens.
+\end{takeawaybox}

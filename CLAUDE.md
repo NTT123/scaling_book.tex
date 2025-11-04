@@ -14,15 +14,17 @@ This is a LaTeX version of "How to Scale Your Model: A Systems View of LLMs on T
 ```
 This is the main command. It automatically:
 - Initializes git submodules if needed
+- **Syncs images from the source submodule** (new!)
 - Runs XeLaTeX three times for cross-references
 - Processes bibliography with BibTeX
-- Generates `scaling-book.pdf` (7+ MB) in project root
+- Generates `scaling-book.pdf` (16MB) in project root
 
 ### Other Build Commands
 ```bash
-./build.sh chapter 01    # Build chapter 01 only
-./build.sh clean         # Remove all build artifacts
-./build.sh help          # Show help
+./build.sh chapter 01         # Build chapter 01 only
+./build.sh clean              # Remove all build artifacts
+./build.sh --skip-images      # Build without syncing images (faster rebuilds)
+./build.sh help               # Show help
 ```
 
 ## Architecture
@@ -31,10 +33,10 @@ This is the main command. It automatically:
 - **`scaling-book-tex/`** - All LaTeX source files
   - `scaling-book-main.tex` - Main document with preamble, packages, and custom commands
   - `chapters/` - Chapter files organized by number
-  - `images/` - All figures and diagrams
+  - `images/` - All figures and diagrams (synced from submodule during build, not committed)
   - `main.bib` - Bibliography database
 - **`build/`** - Build artifacts (gitignored)
-- **`scaling-book/`** - Git submodule of original markdown source (for reference)
+- **`scaling-book/`** - Git submodule of original markdown source (for reference and image source)
 
 ### Chapter Organization
 Chapters use a hybrid structure:
@@ -49,12 +51,14 @@ Chapters use a hybrid structure:
 Main chapter files use `\input{}` to include subdocuments.
 
 ### Build Process Details
-The build script (`build.sh`) operates from project root but:
-1. Changes to `scaling-book-tex/` for XeLaTeX compilation
-2. Outputs to `build/` in project root using absolute paths
-3. Copies final PDF to project root as `scaling-book.pdf`
+The build script (`build.sh`) operates from project root and:
+1. Initializes the git submodule if needed
+2. **Syncs images from `scaling-book/assets/img/` to `scaling-book-tex/images/`** using rsync
+3. Changes to `scaling-book-tex/` for XeLaTeX compilation
+4. Outputs to `build/` in project root using absolute paths
+5. Copies final PDF to project root as `scaling-book.pdf`
 
-This separation keeps source and build artifacts in different locations.
+This separation keeps source and build artifacts in different locations. Images are not committed to the repository - they are automatically synced from the upstream submodule during each build.
 
 ### LaTeX Configuration
 `scaling-book-main.tex` is heavily customized for B6 format:
@@ -89,9 +93,13 @@ The original markdown source is at `scaling-book/` as a submodule pointing to ht
 
 ### Adding/Editing Content
 1. Edit `.tex` files in `scaling-book-tex/chapters/`
-2. For new images, add to `scaling-book-tex/images/`
-3. Run `./build.sh` to regenerate PDF
-4. Check build output for errors in `build/scaling-book-main.log`
+2. For new images:
+   - Images are automatically synced from the `scaling-book` submodule during build
+   - If adding new images to the project, add them to the upstream repository at `https://github.com/jax-ml/scaling-book`
+   - Images in `scaling-book-tex/images/` are gitignored and will be overwritten on next build
+3. Run `./build.sh` to regenerate PDF (images sync automatically)
+4. Use `./build.sh --skip-images` for faster rebuilds when images haven't changed
+5. Check build output for errors in `build/scaling-book-main.log`
 
 ### Debugging Build Issues
 - Build logs: `build/scaling-book-main.log`

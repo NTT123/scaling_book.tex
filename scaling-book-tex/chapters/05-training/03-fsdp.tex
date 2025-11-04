@@ -56,7 +56,7 @@ T &\approx 4 \cdot D \cdot F \cdot \max\left(\frac{B}{X \cdot C}, \frac{1}{W_\te
 Therefore, as with pure data-parallelism, we are compute bound when $B / X > C / W_\text{ici}$, i.e. when the per-device batch size $B/X$ exceeds the ``ICI operational intensity'' $C/W_\text{ici}$ (\texttt{4.59e14 / 1.8e11 = 2550} for v5p). This is great for us, because it means if our per-device batch size is big enough to be compute-bound for pure data-parallelism, we can --- without worrying about leaving the compute-bound regime --- simply upgrade to FSDP, saving ourselves a massive amount of parameter and optimizer state memory!~ Though we did have to add communication to the forward pass, this cost is immaterial since it just overlaps with forward-pass FLOPs.
 
 \begin{takeawaybox}
-Both FSDP and pure Data Parallelism become bandwidth bound on TPUv5 when the batch size per device is less than $2550 / M_X$, where $M_X$ is the number of mesh axes.
+Both FSDP and pure Data Parallelism become bandwidth-bound on TPUv5 when the per-device batch size is less than $2550 / M_X$, where $M_X$ is the number of mesh axes.
 \end{takeawaybox}
 
 For example, DeepSeek-V2 (one of the only recent strong model to release information about its training batch size) used a batch size of \textasciitilde40M tokens. \textbf{This would allow us to scale to roughly 47,000 chips, or around 5 TPUv5 pods, before we hit a bandwidth limit.}

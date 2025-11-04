@@ -1,0 +1,38 @@
+\section{A Thousand-Foot View of the TPU Software Stack}
+
+Google exposes a bunch of APIs for programming TPUs, from high level JAX code to low level Pallas or HLO. Most programmers write JAX code exclusively, which lets you write abstract NumPy-style linear algebra programs that are compiled automatically to run efficiently on TPUs.
+
+Here's a simple example, a JAX program that multiplies two matrices together:
+
+\begin{lstlisting}[language=Python, basicstyle=\small\ttfamily, breaklines=true]
+import jax
+import jax.numpy as jnp
+
+def multiply(x, y):
+  return jnp.einsum('bf,fd->db', x, y)
+
+y = jax.jit(multiply)(jnp.ones((128, 256)), jnp.ones((256, 16), dtype=jnp.bfloat16))
+\end{lstlisting}
+
+By calling \texttt{jax.jit}, we tell JAX to trace this function and emit a lower-level IR called StableHLO, a platform-agnostic IR for ML computation, which is in turn lowered to HLO by the XLA compiler. The compiler runs many passes to determine fusions, layouts, and other factors that result in the HLO that is observable in a JAX profile. This HLO represents all the core linear algebra operations in the JAX code (matmuls, pointwise ops, convolutions, etc) in an LLVM-style graph view. For instance, here is an abridged version of the above program as HLO\footnote{To get this HLO, you can run \texttt{jax.jit(f).lower(*args, **kwargs).compile().as\_text()}.}:
+
+\begin{lstlisting}[language=C, basicstyle=\footnotesize\ttfamily, breaklines=true]
+ENTRY %main.5 (Arg_0.1: f32[128,256], Arg_1.2: bf16[256,16]) -> f32[16,128] {
+  %Arg_1.2 = bf16[256,16]{1,0} parameter(1), metadata={op_name="y"}
+  %convert.3 = f32[256,16]{1,0} convert(bf16[256,16]{1,0} %Arg_1.2),
+  %Arg_0.1 = f32[128,256]{1,0} parameter(0), metadata={op_name="x"}
+  ROOT %dot.4 = f32[16,128]{1,0} dot(f32[256,16]{1,0} %convert.3, f32[128,256]{1,0} %Arg_0.1), lhs_contracting_dims={0}, rhs_contracting_dims={1},
+}
+\end{lstlisting}
+
+We'll explain the syntax of HLO in just a second, but for now just note that it actually matches the JAX code above fairly well. For instance,
+
+\begin{lstlisting}[language=C, basicstyle=\footnotesize\ttfamily, breaklines=true]
+ROOT %dot.4 = f32[16,128]{1,0} dot(f32[256,16]{1,0} %convert.3, f32[128,256]{1,0} %Arg_0.1), lhs_contracting_dims={0}, rhs_contracting_dims={1}
+\end{lstlisting}
+
+is the actual matmul above that multiplies two f32 matrices along the 0 and 1 dimension, respectively.
+
+\textbf{To transform this HLO to code that can be executed on the TPU, the XLA compiler first lowers it to LLO} (low-level optimizer) IR. LLO programs the TPU directly, scheduling copies between memories, pushing arrays onto the systolic array, etc. LLO code contains primitives that push buffers into the systolic array, pull results off, and schedule DMAs that communicate between different pieces of TPU memory. Once this has been lowered to LLO, it is then compiled to machine code that is loaded into the TPU IMEM and executed.
+
+When a program is running slower than we'd like, we primarily work with the JAX level to improve performance. Doing so, however, often requires us to understand some of the semantics of HLO and how the code is actually running on the TPU. When something goes wrong at a lower level, we pull yet another escape hatch and write custom kernels in Pallas. To view the HLO of a program and its runtime statistics, we use the JAX profiler.

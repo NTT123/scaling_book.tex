@@ -1,0 +1,70 @@
+\subsection{Auto sharding mode}
+
+\texttt{jax.jit} plays two roles inside JAX. As the name suggests, it ``just-in-time'' compiles a function from Python into bytecode (via XLA/HLO/LLO) so it runs faster. But if the input is sharded or the user specifies an \texttt{in\_sharding} or \texttt{out\_sharding}, it also lets XLA distribute the computation across multiple devices and add communication as needed. For example, here's how you could write a sharded matmul using \texttt{jax.jit}:
+
+\begin{lstlisting}[language=Python, basicstyle=\small\ttfamily, breaklines=true]
+import jax
+import jax.numpy as jnp
+
+# Running on an TPU v5e 4x2. This assigns names to the two physical axes of the hardware.
+mesh = jax.make_mesh(axis_shapes=(4, 2), axis_names=('X', 'Y'))
+
+# This tells JAX to use this mesh for all operations, so you can just specify the PartitionSpec P.
+jax.set_mesh(mesh)
+
+# We create a matrix W and input activations In sharded across our devices.
+In = jnp.zeros((8, 2048), dtype=jnp.bfloat16, device=jax.NamedSharding(mesh, jax.P('X', 'Y')))
+W = jnp.zeros((2048, 8192), dtype=jnp.bfloat16, device=jax.NamedSharding(mesh, jax.P('Y', None)))
+
+def matmul_square(In, W):
+  return jnp.einsum('bd,df->bf', jnp.square(In), W)
+
+# We can explicitly compile the sharded matmul function here. This adds all the
+# necessary comms (e.g. an AllReduce after the matmul).
+jit_matmul = jax.jit(matmul_square, out_shardings=jax.P('X', None)).lower(In, W).compile()
+
+out = jit_matmul(In, W)
+\end{lstlisting}
+
+This will run automatically with any sharding and partition the computation across our devices. \textbf{But what's actually happening at the hardware level?}
+
+\begin{enumerate}
+\item First we create In and W sharded across our devices\footnote{Notice how we did this. This is one way to create an array with a particular sharding (i.e. by adding the device argument to the creation function). Another one is to create an array normally with \texttt{jnp.array(....)} and then do e.g. \texttt{jax.device\_put(..., P('x', 'y'))}. Yet another is to write a function which creates the array you want, and jit-compile it with \texttt{out\_shardings} being what you want.}. W is sharded 2 way along the contracting dimension, while In is sharded 4-ways (along both the contracting and output dimensions). This corresponds to a sharding $W[D_Y, F]$ and $In[B_X, D_Y]$, aka a kind of model and data parallelism.
+
+\item If we were running this locally (i.e. on one device), \texttt{matmul\_square} would simply square the input and perform a simple matmul. But because we specify the \texttt{out\_shardings} as \texttt{P('X', None)}, the output will be sharded along the batch but replicated across the model dimension and will require an AllReduce to compute.
+\end{enumerate}
+
+Using our notation from previous sections, this will likely do something like
+
+\begin{enumerate}
+\item $Out[B_X, F] \{ U_Y \} = In[B_X, D_Y] *_D W[D_Y, F]$
+\item $Out[B_X, F] = \textbf{AllReduce}(Out[B_X, F] \{ U_Y \})$
+\end{enumerate}
+
+\texttt{jax.jit} will add this for us automatically! We can actually print the HLO with \texttt{jit\_matmul.as\_text()} and see the following HLO (abbreviated dramatically):
+
+\begin{lstlisting}[language=C, basicstyle=\footnotesize\ttfamily, breaklines=true]
+# This fusion is the actual matmul of the sharded inputs and matrix
+%fusion = bf16[2,8192]{1,0:T(4,128)(2,1)S(1)} fusion(bf16[2,1024]{1,0:T(4,128)(2,1)} %param, bf16[8192,1024]{1,0:T(8,128)(2,1)S(1)} %copy-done)
+
+# We reduce the partially summed results across devices
+ROOT %AllReduce = bf16[2,8192]{1,0:T(4,128)(2,1)} AllReduce(bf16[2,8192]{1,0:T(4,128)(2,1)S(1)} %fusion)
+\end{lstlisting}
+
+We can see the matmul (the fusion) and the AllReduce above. Pay particular attention to the shapes. \texttt{bf16[2, 1024]} is a local view of the activations, since our \texttt{batch\_size=8} is split across 4 devices and our \texttt{d\_model=2048} is likewise split 2 ways.
+
+\textbf{This is pretty magical!} No matter how complicated our program is, Shardy and jit will attempt to find shardings for all the intermediate activations and add communication as needed. With that said, Shardy has its flaws. It can make mistakes. Sometimes you'll look at a profile and notice something has gone wrong. A giant AllGather takes up 80\% of the profile, where it doesn't need to. When this happens, we can try to correct the compiler by explicitly annotating intermediate tensors with \texttt{jax.lax.with\_shar\-ding\_con\-straint}. For instance, with two matmuls I can force the intermediate activations to be sharded along the \texttt{y} dimension (not that this is a good idea) with the following:
+
+\begin{lstlisting}[language=Python, basicstyle=\small\ttfamily, breaklines=true]
+import jax
+import jax.numpy as jnp
+
+mesh = jax.make_mesh((4, 2), ('X', 'Y'))
+
+def matmul(x, Win, Wout):
+  hidden = jnp.einsum('bd,df->bf', x, Win)
+  hidden = jax.lax.with_sharding_constraint(hidden, jax.P('x', 'y'))
+  return jnp.einsum('bf,df->bd', hidden, Wout)
+\end{lstlisting}
+
+This makes up like 60\% of JAX parallel programming in the automatic partitioning world where you control the intermediate shardings via \texttt{jax.lax.with\_shar\-ding\_con\-straint}. But ``compiler tickling'' is famously not a fun programming model. You could annotate every intermediate variable and still not know if you'll get the right outcome. Instead, what if JAX itself could handle and control sharding propagation?

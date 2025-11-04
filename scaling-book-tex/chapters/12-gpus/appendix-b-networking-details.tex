@@ -1,0 +1,67 @@
+\section{Appendix B: More networking details}
+
+Here's a diagram of an NVLink 4 switch. There are 64 overall NVLink4 ports (each uses 2 physical lanes), and a large crossbar that handles inter-lane switching. TPUs by contrast use optical switches with mirrors that can be dynamically reconfigured.
+
+\begin{figure}[htb]
+\centering
+\includegraphics[width=\textwidth]{images/gpu/nvlink4.png}
+\caption{A lower level view of a single NVLink4 Switch.}
+\label{fig:nvlink4}
+\end{figure}
+
+At each level we can be bottlenecked by the available link bandwidth or the total switch bandwidth.
+
+\begin{itemize}
+\item \textbf{Node level:} at the node level, we have $4 \times 1.6\text{TB/s} = 6.4\text{TB/s}$ of NVSwitch bandwidth, but each of our 8 GPUs can only egress 450GB/s into the switch, meaning we actually have a peak bandwidth of $450\text{e}9 \times 8 = 3.6\text{TB/s}$ (full-duplex) within the node.
+
+\item \textbf{SU/leaf level:} at the SU level, we have 8 switches connecting 32 nodes in an all-to-all fashion with 1x400 Gbps Infiniband. This gives us $8 \times 32 \times 400 / 8 = 12.8\text{TB/s}$ of egress bandwidth from the nodes, and we have $8 \times 1.6\text{TB/s} = 12.8\text{TB/s}$ at the switch level, so both agree precisely.
+
+\item \textbf{Spine level:} at the spine level, we have 16 switches connecting 32 leaf switches with 2x400 Gbps links, so we have $32 \times 16 \times 400 \times 2 / 8 = 51.2\text{TB/s}$ of egress bandwidth. The 16 switches give us $16 \times 1.6\text{TB/s} = 25.6\text{TB/s}$ of bandwidth, so this is the bottleneck at this level.
+\end{itemize}
+
+Per GPU, this gives us 450GB/s of GPU to GPU bandwidth at the node level, 50GB/s at the SU level, and 25 GB/s at the spine level.
+
+\textbf{GPU empirical AR bandwidth:}
+
+\begin{figure}[htb]
+\centering
+\includegraphics[width=\textwidth]{images/gpu/gpu-all-reduce-bw.png}
+\caption{AllReduce bandwidth on an 8xH100 cluster (intra-node, SHARP disabled).}
+\label{fig:gpu-all-reduce-bw-appendix}
+\end{figure}
+
+TPU v5p bandwidth (1 axis):
+
+\begin{figure}[htb]
+\centering
+\includegraphics[width=\textwidth]{images/gpu/tpu-all-reduce-bw.png}
+\caption{AllReduce bandwidth on a TPU v5p 4x4x4 cluster (along one axis).}
+\label{fig:tpu-all-reduce-bw}
+\end{figure}
+
+Here's AllGather bandwidth as well:
+
+\begin{figure}[htb]
+\centering
+\includegraphics[width=\textwidth]{images/gpu/gpu-all-gather-bw.png}
+\caption{AllGather bandwidth on an 8xH100 cluster (intra-node).}
+\label{fig:gpu-all-gather-bw}
+\end{figure}
+
+\begin{figure}[htb]
+\centering
+\includegraphics[width=\textwidth]{images/gpu/tpu-all-gather-bw.png}
+\caption{AllGather bandwidth on a TPU v5e 8x16 cluster (along one axis).}
+\label{fig:tpu-all-gather-bw}
+\end{figure}
+
+\textbf{More on AllToAll costs:}
+
+Here we can compare the approximation $\min(K / Z) \cdot (Z - 1) / Z$ to the true value of $(1 - ((Z - 1) / Z)^K) \cdot (Z - 1) / Z$. They're similar except for small values of $Z$.
+
+\begin{figure}[htb]
+\centering
+\includegraphics[width=\textwidth]{images/gpu/all-to-all-approx.png}
+\caption{A comparison of the approximate and true cost of a ragged AllToAll as the number of shards increases.}
+\label{fig:all-to-all-approx}
+\end{figure}

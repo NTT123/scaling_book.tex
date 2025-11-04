@@ -97,7 +97,7 @@ We can get a nice simplification if we assume our ``batch size'' $B$ is small re
 This is a reasonable assumption for Transformer matmuls since we typically have a local (per-replica) batch size $B < 1024$ tokens (\emph{not sequences}) but $D$ and $F > 8000$. Thus we generally become compute-bound when our per-replica\footnote{We say per-replica because, if we do some kind of model sharding to increase the number of chips used in the matmul, we scale both our available compute and memory bandwidth by the same amount. Thus the critical batch size is true per independent copy of the model weights.} batch size is greater than 240 tokens, a very simple rule!
 
 \begin{takeawaybox}
-For a bfloat16 matmul to be compute-bound on most TPUs, we need our per-replica token batch size to be greater than 240.\footnote{Note that this is \emph{not} the batch size in the usual sense, where it means the batch size in sequences. It turns out most rooflines depend purely on the number of tokens, whether they belong to the same or different sequences. For instance if you have a batch size of 512 sequences of 4096 tokens on 128 GPUs, you have a total batch size of \texttt{512 * 4096 = 2M} tokens, and a local batch size of 16k tokens.}
+For a bfloat16 matmul to be compute-bound on most TPUs, we need our per-replica token batch size to be greater than 240.\footnote{Note that this is \emph{not} the batch size in the usual sense, where it means the batch size in sequences. It turns out most rooflines depend purely on the number of tokens, whether they belong to the same or different sequences. For instance if you have a batch size of 512 sequences of 4096 tokens on 128 GPUs, you have a total batch size of \texttt{512 * 4096 = 2M} tokens, and a per-device batch size of 16k tokens.}
 \end{takeawaybox}
 
 This comes with a few notable caveats we'll explore in the problems below, particularly with respect to quantization (e.g., if we quantize our activations but still do full-precision FLOPs), but it's a good rule to remember. For GPUs, this number is slightly higher (closer to 300), but the same conclusion generally holds. When we decompose a big matmul into smaller matmuls, the tile sizes also matter.\footnote{When we do a large matrix multiplication, we need to break it down into smaller tiles which fit into VMEM/SMEM/TMEM, the higher-bandwidth on-chip memory. This causes us to load chunks multiple times, so it's no longer quite true that we only load $O(N^2)$ bytes. Consider an $(m, k) \cdot (k, n)$ matmul with tile sizes $bm$, $bk$, $bm$. Let $tm = m / bm$, etc. Then the total FLOPs is $2 \cdot tm \cdot tn \cdot tk \cdot bm \cdot bn \cdot bk$ and the total bytes are $2 \cdot tm \cdot tn \cdot (tk \cdot (bm \cdot bk + bk \cdot bn) + 2 \cdot bm \cdot bn)$. Ignoring the last term, we have an intensity of $bm \cdot bn / (bm + bn)$, which is similar to the above.} We'll discuss the lower-level GPU and TPU details in the next section.
@@ -109,7 +109,7 @@ All the rooflines we've discussed so far have been memory-bandwidth rooflines, \
 
 To pick a somewhat contrived example, say we want to multiply two big matrices $X\sim \text{bfloat16[B, D]}$ and $Y \sim \text{bfloat16[D, F]}$ which are split evenly across 2 TPUs/GPUs (along the $D$ dimension). To do this multiplication (as we'll see in Section 3), we can multiply half of each matrix on each TPU (\texttt{A = X[:, :D // 2] @ Y[:D // 2, :]} on TPU 0 and \texttt{B = X[:, D // 2:] @ Y[D // 2:, :]} on TPU 1) and then copy the resulting ``partial sums'' to the other TPU and add them together. Say we can copy \texttt{4.5e10} bytes in each direction and perform \texttt{1.97e14} FLOPs/s on each chip. What are $T_\text{math}$ and $T_\text{comms}$?
 
-$T_\text{math}$ is clearly half of what it was before, since each TPU is doing half the work, i.e.\footnote{We're ignoring the FLOPs required to add the two partial sums together (another DF additions), but this is basically negligible.}
+$T_\text{math}$ is clearly half of what it was before, since each TPU is doing half the work, i.e.\footnote{We're ignoring the FLOPs required to add the two partial sums together (another DF additions), but this is basically negigible.}
 
 $$T_\text{math} = \frac{2BDF}{2 \cdot \text{Accelerator FLOPs/s}} = \frac{BDF}{1.97e14}$$
 
@@ -117,7 +117,13 @@ Now what about $T_\text{comms}$? This now refers to the communication time betwe
 
 $$T_\text{comms} = \frac{2BF}{\text{Network Bandwidth}} = \frac{2BF}{4.5e10}$$
 
-Therefore we become compute-bound (now with respect to the inter-chip network) when $$\text{Intensity}(\text{matmul (2-chips)}) > \text{Intensity}(\text{TPU w.r.t. inter-chip network})$$ or equivalently when $\frac{BDF}{2BF} = \frac{D}{2} > \frac{1.97e14}{4.5e10} = 4377$ or $D > 8755$. Note that, unlike before, the critical threshold now depends on $D$ and not $B$! Try to think why that is. This is just one such example, but we highlight that this kind of roofline is critical to knowing when we can parallelize an operation across multiple TPUs.
+Therefore we become compute-bound (now with respect to the inter-chip network) when
+{\small
+$$\text{Intensity}(\text{matmul (2-chips)}) > \text{Intensity}(\text{TPU w.r.t. inter-chip network})$$
+}
+or equivalently when
+$$\frac{BDF}{2BF} = \frac{D}{2} > \frac{1.97e14}{4.5e10} = 4377$$
+or $D > 8755$. Note that, unlike before, the critical threshhold now depends on $D$ and not $B$! Try to think why that is. This is just one such example, but we highlight that this kind of roofline is critical to knowing when we can parallelize an operation across multiple TPUs.
 
 \section*{A Few Problems to Work}
 \addcontentsline{toc}{section}{A Few Problems to Work}

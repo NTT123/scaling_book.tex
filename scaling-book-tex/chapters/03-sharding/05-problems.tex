@@ -7,14 +7,6 @@
 
 \textbf{Question 2 [AllGather latency]:} How long should $\text{AllGather}_X([B_X, D_Y])$ take on a TPUv4p 4x4x4 slice with mesh \texttt{Mesh(\{'X': 4, 'Y': 4, 'Z': 4\})} if $B=1024$ and $D=4096$ in bfloat16? How about $\text{AllGather}_{XY}([B_X, D_Y])$? How about $\text{AllReduce}_Z([B_X, D_Y] \{U_Z \})$?
 
-\begin{enumerate}
-\item Because we're just gathering over one axis and the other is sharded, we're effectively gathering $2BD / Y$ bytes over 1 axis. \textit{If you think about just a single shard along the Y-axis, the AllGather along X looks like an unsharded AllGather with 1 / Y of the bytes.} Since our ICI bandwidth for TPU v4p is 9e10 bytes/second bidirectional, this will take $2BD / (\text{9e10} \cdot Y) = 2 \cdot 1024 \cdot 4096 / (\text{9e10} \cdot 4) = 23 \mu s$.
-
-\item We have twice the bandwidth as before but we're AllGathering the full array, so \texttt{T = 2BD / (2 * W) = 2*1024*4096 / (2 * 9e10) = 46us}. This is far from the latency bound of 4us (1us per hop), so we're fine.
-
-\item The cost of an AllReduce is twice that of an AllGather. Each shard has size $2BD / (X * Y)$, so the cost is about $4BD / (X * Y * W)$, or roughly \texttt{4 * 1024 * 4096 / (16 * 9e10) = 11.6us}.
-\end{enumerate}
-
 \textbf{Question 3 [latency-bound AllGather]:} Let's say we're performing an $\text{AllGather}_X([B_X])$ but $B$ is very small (say 128). How long should this take on a TPUv4p 4x4x4 slice with mesh \texttt{Mesh(\{'X': 4, 'Y': 4, 'Z': 4\})} in bfloat16? \textit{Hint: you're probably latency bound.}
 
 \textbf{Question 4 [matmul strategies]:} To perform $X[B, D] \cdot_D Y[D_X, F] \to Z[B, F]$, in this section we tell you to perform $\text{AllGather}_X(Y[D_X, F])$ and multiply the fully replicated matrices (Case 2, \textit{Strategy 1}). Instead, you could multiply the local shards like $X[B, D_X] \cdot_D Y[D_X, F] \to Z[B, F] \{U_X\}$ (Case 4, \textit{Strategy 2}), and then $\text{AllReduce}_X(Z[B, F] \{ U_X\})$. How many FLOPs and comms does each of these perform? Which is better and why?

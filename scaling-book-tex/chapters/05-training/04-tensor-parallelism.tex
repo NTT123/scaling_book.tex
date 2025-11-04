@@ -13,7 +13,9 @@ In a fully-sharded data-parallel AllReduce we move the weights across chips. We 
 
 As noted, $\textbf{In}[B, D_Y] \times_D W_{\text{in}}[D, F_Y] \times_F W_{\text{out}}[F_Y, D] \rightarrow \textbf{Out}[B, D_Y]$ means we have to gather our activations before the first matmul. This is cheaper than ZeRO sharding when the activations are smaller than the weights. This is typically true only with some amount of ZeRO sharding added (which reduces the size of the gather). This is one of the reasons we tend to mix ZeRO sharding and tensor parallelism.
 
-\begin{tcolorbox}[algorithmbox, title=Algorithm: Tensor Parallelism]
+\begin{algorithmbox}
+
+\textbf{Algorithm: Tensor Parallelism}
 
 \textbf{Forward pass:} need to compute Loss[B]
 
@@ -38,7 +40,7 @@ As noted, $\textbf{In}[B, D_Y] \times_D W_{\text{in}}[D, F_Y] \times_F W_{\text{
     \item dIn[B, D\textsubscript{Y}] = \textbf{ReduceScatter}(dIn[B, D] \{U.Y\}) \textit{(on critical path)}
 \end{enumerate}
 
-\end{tcolorbox}
+\end{algorithmbox}
 
 One nice thing about tensor parallelism is that it interacts nicely with the two matrices in our Transformer forward pass. Naively, we would do an AllReduce after each of the two matrices. But here we first do $\textbf{In}[B, D_Y] \times W_{\text{in}}[D, F_Y] \rightarrow \textbf{Tmp}[B, F_Y]$ and then $\textbf{Tmp}[B, F_Y] \times W_{\text{out}}[F_Y, D] \rightarrow \textbf{Out}[B, D_Y]$. This means we AllGather $\textbf{In}$ at the beginning, and ReduceScatter $\textbf{Out}$ at the end, rather than doing an AllReduce.
 
@@ -67,9 +69,9 @@ F > Y \cdot \frac{C}{W_\text{ici}}
 
 Thus for instance, for TPUv5p, $C / W_{ici} = 2550$ in bf16, so we can only do tensor parallelism up to $Y < F / 2550$. When we have multiple ICI axes, our $T_\text{comms}$ is reduced by a factor of $M_Y$, so we get $Y < M_Y \cdot F / 2550$.
 
-\begin{tcolorbox}[takeawaybox]
-Tensor Parallelism becomes communication bound when $Y > M_Y \cdot F / 2550$. For most models this is between 8 and 16-way tensor parallelism.
-\end{tcolorbox}
+\begin{takeawaybox}
+Tensor Parallelism becomes bandwidth-bound when $Y > M_Y \cdot F / 2550$. For most models this is between 8 and 16-way tensor parallelism.
+\end{takeawaybox}
 
 \textbf{Note that this doesn't depend on the precision of the computation}, since e.g.\ for int8, on TPUv5p, $C_\text{int8} / W_{ici}$ is $5100$ instead of $2550$ but the comms volume is also halved, so the two factors of two cancel.
 

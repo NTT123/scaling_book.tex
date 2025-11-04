@@ -18,7 +18,7 @@ This also effectively increases the arithmetic intensity of the attention comput
 \begin{figure}[htb]
 \centering
 \includegraphics[width=\textwidth]{images/kv-sharing.png}
-\caption{\textbf{Left:} Multiple layers of pure global attention. \textbf{Right:} An example of some global/local interleaving pattern with sharing with adjacent layers.}
+\caption{\textbf{Left:} Multiple layers of pure global attention. \textbf{Right:} An example of some global/local interleaving pattern with sharing with adjacent layers. Source: \href{https://research.character.ai/optimizing-inference/?ref=blog.character.ai}{Character.ai blog}.}
 \end{figure}
 
 \textbf{Quantization:} Inference is usually less sensitive to the precision of parameters and KVs. By quantizing the parameters and KV cache (e.g. to int8, int4, \texttt{fp8} etc.), we can save on memory bandwidth on both, decrease the batch size required to reach the compute roofline and save memory to run at bigger batch sizes. Quantization has the added advantage that even if the model was not trained with quantization it can often be applied post training.

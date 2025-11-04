@@ -20,7 +20,8 @@
 \setlength{\hfuzz}{0.5pt}
 
 % Essential packages
-\usepackage{amsmath,amssymb}
+\usepackage{amsmath}
+% Note: amssymb is loaded by fontsetup, so we don't load it again to avoid conflicts
 
 % Allow breaking of long equations across lines and pages
 \allowdisplaybreaks
@@ -66,17 +67,12 @@
 \definecolor{numbercolor}{RGB}{9,134,88}
 \definecolor{operatorcolor}{RGB}{102,102,102}
 
-% Define Shaded environment for code blocks
-\newenvironment{Shaded}{%
-  \begin{snugshade}%
-  \footnotesize%
-}{%
-  \end{snugshade}%
-}
+% Load framed package first
+\usepackage{framed}
 
-% Define snugshade environment
+% Redefine snugshade environment (framed package provides a default version)
 \makeatletter
-\newenvironment{snugshade}{%
+\renewenvironment{snugshade}{%
   \def\FrameCommand##1{\hskip\@totalleftmargin
     \colorbox{shadecolor}{##1}%
     \hskip-\linewidth \hskip-\@totalleftmargin \hskip\columnwidth}%
@@ -86,7 +82,13 @@
 {\par\unskip\endMakeFramed}
 \makeatother
 
-\usepackage{framed}
+% Define Shaded environment for code blocks
+\newenvironment{Shaded}{%
+  \begin{snugshade}%
+  \footnotesize%
+}{%
+  \end{snugshade}%
+}
 
 % Define Highlighting environment with line wrapping
 % Using scriptsize for better fit on B6 pages
@@ -255,6 +257,11 @@ Reiner Pope\textsuperscript{*}\\[1em]
 \input{chapters/05-training}
 \input{chapters/06-llama3}
 \input{chapters/07-inference}
+\input{chapters/08-applied-inference}
+\input{chapters/09-profiling}
+\input{chapters/10-jax-stuff}
+\input{chapters/11-conclusion}
+\input{chapters/12-gpus}
 
 % Bibliography
 \bibliography{main}

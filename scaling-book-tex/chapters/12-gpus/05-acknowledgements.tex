@@ -1,0 +1,35 @@
+\section{Acknowledgements and Further Reading}
+
+This chapter relied heavily on help from many knowledgeable GPU experts, including:
+
+\begin{itemize}
+\item Adam Paszke, who helped explain the realities of kernel programming on GPUs.
+\item Swapnil Patil, who first explained how GPU networking works.
+\item Stas Bekman, who pointed out that the empirical realities of GPUs are often different from the purported specs.
+\item Reiner Pope, who helped clarify how GPUs and TPUs compare at a hardware level.
+\item Frédéric Bastien, who gave detailed feedback on the chip-level story.
+\item Nouamane Tazi, whose experience with LLM training on GPUs helped improve the roofline section.
+\item Sanford Miller, who helped me understand how GPUs are networked and how NVIDIA's specifications compare to what's often deployed in the field.
+\end{itemize}
+
+There's a great deal of good reading on GPUs, but some of my favorites include:
+
+\begin{itemize}
+\item \textbf{SemiAnalysis' History of the NVIDIA Tensor Core}\footnote{See: \texttt{semianalysis.com/2025/06/23/nvidia-tensor-core-evolution-from-volta-to-blackwell/}}: a fantastic article describing how GPUs transformed from video game engines to ML accelerators.
+
+\item \textbf{SemiAnalysis' Analysis of Blackwell Performance}\footnote{See: \texttt{semianalysis.com/2024/04/10/nvidia-blackwell-perf-tco-analysis/}}: worth reading to understand the next generation of NVIDIA GPUs.
+
+\item \textbf{H100 DGX SuperPod Reference}\footnote{See NVIDIA documentation: \texttt{docs.nvidia.com/} \texttt{dgx-superpod-reference-architecture-dgx-h100.pdf}}: dry but useful reading on how larger GPU clusters are networked. A similar document about the GB200 systems is also available.\footnote{See: \texttt{docs.nvidia.com/dgx-superpod/reference-architecture-scalable-infrastructure-gb200/} \texttt{latest/network-fabrics.html\#compute-fabric-576}}
+
+\item \textbf{Hot Chips Talk about the NVLink Switch}\footnote{\scriptsize See: \texttt{hc34.hotchips.org/assets/program/conference/day2/}\\\texttt{Network\%20and\%20Switches/NVSwitch\%20HotChips\%202022\%20r5.pdf}}: fun reading about NVLink and NCCL collectives, especially including in-network reductions.
+
+\item \textbf{DeepSeek-V3 Technical Report}\footnote{arXiv preprint: \texttt{arxiv.org/pdf/2412.19437}}: a good example of a large semi-open LLM training report, describing how they picked their sharding setup.
+
+\item \textbf{How to Optimize a CUDA Matmul}\footnote{See: \texttt{siboehm.com/articles/22/CUDA-MMM}}: a great blog describing how to implement an efficient matmul using CUDA Cores, with an eye towards cache coherence on GPU.
+
+\item \textbf{HuggingFace Ultra-Scale Playbook}\footnote{See: \texttt{huggingface.co/spaces/nanotron/ultrascale-playbook}}: a guide to LLM parallelism on GPUs, which partly inspired this chapter.
+
+\item \textbf{Making Deep Learning Go Brrrr From First Principles}\footnote{See: \texttt{horace.io/brrr\_intro.html}}: a more GPU and PyTorch-focused tutorial on LLM rooflines and performance engineering.
+
+\item \textbf{Cornell Understanding GPU Architecture site}\footnote{See: \texttt{cvw.cac.cornell.edu/gpu-architecture}}: a similar guide to this book, comparing GPU and CPU internals more specifically.
+\end{itemize}

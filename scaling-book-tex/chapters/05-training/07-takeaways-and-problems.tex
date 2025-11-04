@@ -1,7 +1,7 @@
 \section{Takeaways from LLM Training on TPUs}
 
 \begin{itemize}
-\item Increasing parallelism or reducing batch size both tend to make us more communication-bound because they reduce the amount of compute performed per chip.
+\item Increasing parallelism or reducing batch size both tend to make us more communication-bound because they reduce the amount of compute performed per device.
 
 \item Up to a reasonable context length~($\sim$32k) we can get away with modeling a Transformer as a stack of MLP blocks and define each of several parallelism schemes by how they shard the two/three main matmuls per layer.
 
@@ -60,7 +60,7 @@ FSDP + TP & $4BDF/(XY) + 8BDF/(XY)$ & $(4BD/X + 4DF/Y) + (8BD/X + 8DF/Y)$ \\
 \begin{itemize}
 \item Pure data parallelism is rarely useful because the model and its optimizer state use bytes~= 10x parameter count. This means we can rarely fit more than a few billion parameters in memory.
 
-\item Data parallelism and FSDP become comms bound when the~$\text{batch size per shard} < C / W$, the arithmetic intensity of the network. For ICI this is~2,550 and for DCN this is~75,000. This can be increased with more parallel axes.
+\item Data parallelism and FSDP become comms bound when the per-device batch size $< C / W$, the arithmetic intensity of the network. For ICI this is~2,550 and for DCN this is~75,000. This can be increased with more parallel axes.
 
 \item Tensor parallelism becomes comms bound when~$|Y| > F / 2550$. \textbf{This is around 8--16~way for most models.} This is independent of the batch size.
 

@@ -1,0 +1,213 @@
+\section{Rooflines for LLM Scaling on GPUs}
+
+Now let's look at what this has all been building towards: understanding rooflines for LLM scaling on GPU. This is to complement the TPU training chapter. As we did there, the goal here is to look at the total $T_\text{math}$ and $T_\text{comms}$ for different parallelism strategies and understand at what point $T_\text{comms} > T_\text{math}$. As before, we consider only the MLP block with operations
+
+$$\text{MLP}(x) \equiv x[B, D] *_D W_\text{in}[D, F] \cdot_F W_\text{out}[F, D]$$
+
+where $B$ is the global batch size \textbf{in tokens} (i.e. $B = \text{batch size} \cdot \text{sequence length}$).
+
+Here we'll reproduce the table above showing effective bandwidths at both the GPU and node level:
+
+\begin{table}[htb]
+\centering
+\small
+\begin{tabular}{lccc}
+\toprule
+\textbf{Node Type} & \textbf{GPUs} & \textbf{GPU egress} & \textbf{Node egress} \\
+ & \textbf{per node} & \textbf{BW (GB/s)} & \textbf{BW (GB/s)} \\
+\midrule
+H100 & 8 & 450 & 400 \\
+B200 & 8 & 900 & 400 \\
+GB200 NVL72 & 72 & 900 & 3600 \\
+\bottomrule
+\end{tabular}
+\caption{Node types comparison showing effective bandwidths. GPU egress BW is bandwidth from each GPU within the node. Node egress BW is bandwidth from the entire node to the scale-out network.}
+\label{tab:node-types-rooflines}
+\end{table}
+
+\textbf{Note:} Both the GPU and node egress bandwidths determine rooflines for our LLMs. We'll use the term $W_\text{collective}$ to describe either the GPU or node bandwidths depending on whether we are operating within or above the node level.
+
+Let's look at the compute communication rooflines as we did for TPUs for \textbf{data parallelism, tensor parallelism, pipeline parallelism, expert parallelism,} and combinations thereof. For the rest of this section we'll focus on H100 rooflines for specific calculations. GB200-NVL72 has the same general rooflines but because we have a larger node egress bandwidth, we can sometimes be bottlenecked at the node level instead.
+
+\subsection{Data Parallelism}
+
+As noted before, DP and ZeRO sharding involve either a weight AllReduce or a ReduceScatter + AllGather in the backward pass. Since these both have the same cost, to be compute-bound for pure data parallelism or FSDP \emph{without in-network reductions}, we have, per layer, in the backward pass, with an axis of size X:
+
+$$T_\text{math} = \frac{2 \cdot 2 \cdot 2 \cdot BDF}{X \cdot C}$$
+
+$$T_\text{comms} = \frac{2 \cdot 2 \cdot 2 \cdot DF}{W_\text{collective}}$$
+
+Therefore, for $T_\text{math} > T_\text{comms}$, we need $B / (XC) > 1 / W_\text{collective}$ or
+
+$$\frac{B}{X} > \frac{C}{W_\text{collective}}$$
+
+where $W_\text{collective}$ is either the GPU or node level egress bandwidth depending on whether we're sharding within a node or across nodes. Thus:
+
+\begin{itemize}
+\item \textbf{Within a node}, we just need the per-device \textbf{token} batch size > $\text{990e12} / \text{450e9} = 2200$.
+\item \textbf{Within an SU or at the spine level}, BS > $\text{990e12} / \text{400e9} = 2475$.
+\end{itemize}
+
+This is quite a bit higher than on a TPU, where the number is 850 with all three axes. For instance, LLaMA-3, which trained on 16000 H100s would need a batch size of at least 40M tokens (for reference, they used 16M). DeepSeek v3 trained on 2048 H800 GPUs with lower 300GB/s of bandwidth (instead of 450GB/s on H100) would need $\text{990e12} / \text{300e9} = 3300$ tokens per GPU, or about 6.7M (in practice, they used 4M).
+
+With in-network reductions enabled and using pure data parallelism, theoretically we have 2x the AllReduce bandwidth, which would halve both of these numbers. However, in practice the benefit is closer to 30\%, which only really makes up for the fact that we typically struggle to reach the reported numbers. Furthermore, because pure data parallelism is rarely useful, this basically doesn't matter in practice.
+
+\textbf{MoE models:} For a Mixture of Experts (MoE) model, where we have E experts and k experts per token, this increases to
+
+$$T_\text{math} = \frac{2 \cdot 2 \cdot 2 \cdot k \cdot BDF}{X \cdot C}$$
+
+$$T_\text{comms} = \frac{2 \cdot 2 \cdot 2 \cdot EDF}{W_\text{collective}}$$
+
+which inflates the per-device token batch size by a factor of $E/k$, i.e.
+
+$$\frac{B}{X} > \frac{E}{k} \frac{C}{W_\text{collective}}$$
+
+For example, the new OpenAI OSS model with $k=4$ and $E=128$, this increases to \texttt{32 * 2475 = 79,200} across nodes, a kind of ridiculously high number.
+
+\textbf{What happens when X is small?} When we do only e.g. 2-node data parallelism, we benefit from the $(X - 1) / X$ scaling, which gives us
+
+$$T_\text{math} = \frac{2 \cdot 2 \cdot 2 \cdot BDF}{N * C}$$
+
+$$T_\text{comms} = \frac{2 \cdot 2 \cdot 2 \cdot DF \cdot (X-1)}{X \cdot W_\text{collective}}$$
+
+where X is the number of nodes and $N = 8 \cdot X$. Then for a dense model we have $B / N > \alpha \cdot (X - 1) / X$, or e.g. $B / N > \text{1237}$, half the above value. You'll notice 2-way data parallelism fairly often for this reason.
+
+\begin{takeawaybox}
+\textbf{Takeaway:} Data parallelism and ZeRO sharding require a per-device batch size of about 2500 tokens to be compute-bound on an H100 or B200, assuming perfect overlap and FLOPs utilization. For MoE models, this increases by a factor of $E / k$, the ratio of total to activated parameters. When doing a small amount of data parallelism, the critical batch size decreases.
+\end{takeawaybox}
+
+\subsection{Tensor Parallelism}
+
+Tensor parallelism requires an AllGather and ReduceScatter over the activations, which we need to overlap with the MLP FLOPs. In other words, in the forward pass, we have
+
+$$T_\text{math} = \frac{2\cdot 2 \cdot BDF}{Y \cdot C}$$
+
+$$T_\text{comms} = \frac{2\cdot 2 \cdot BD}{W_\text{collective}}$$
+
+which to be compute-bound gives us the rule
+
+$$Y < \frac{F \cdot W_\text{collective}}{C}$$
+
+Within a node, this gives us about $F / 2200$ or $F / 2475$ beyond a node. For $F=\text{28000}$ like LLaMA-3, this is about 11-way TP (or rounding down, about 8-way, which is how large a node is). As with above, we get an extra 2X bandwidth when we span exactly 2 nodes, so we can generally do 16-way tensor parallelism ($F > 2475 \cdot (Y - 8)$), which gives us up to 19-way model parallelism in theory.
+
+\begin{takeawaybox}
+\textbf{Takeaway:} Tensor parallelism over an axis of size Y with feed-forward dimension F becomes bandwidth-bound when the $Y > F / 2475$, which generally constrains us to only intra-node TP or at most 2-node TP.
+\end{takeawaybox}
+
+\subsection{Expert Parallelism}
+
+As we've already noted above, Mixture of Expert (MoE) models come with E times more model weights with only k times more FLOPs, making data parallelism significantly harder. We can mitigate this somewhat by sharding the our weights along the expert dimension, i.e. $W_\text{in}[E_Z, D, F]$. To do the MLP block, we need to introduce 2x AllToAll to send our activations to the corresponding experts.
+
+As noted above, the cost of this $\text{AllToAll}_{Z \to k}([B, D, k])$ if it spans multiple nodes is roughly $T_\text{AllToAll} = 2 \cdot B \cdot D \cdot (Z-8)/Z \min(8 * k / Z, 1)$, so for pure expert parallelism we need
+
+$$T_\text{math} = \frac{4 \cdot B \cdot k \cdot D \cdot F}{Z \cdot C}$$
+
+$$T_\text{comms} = \frac{4 \cdot B \cdot D \cdot (Z-8)}{W \cdot Z} \cdot \min\left(\frac{8 \cdot k}{Z}, 1\right)$$
+
+We either need $K > Z/8$ with $F > \alpha \cdot (Z - 8)/k$ or $Z \gg K$ and $F > 8 \cdot \alpha$, where $\alpha = C/W$. This gives you two domains in which expert parallelism is possible, one with a small amount of expert parallelism (roughly 2-node) and small $F$, or one with large $F$ and $Z$ arbitrarily large (up to E-way expert parallelism).
+
+You'll see both cases in practice, either a small amount of expert-parallelism (like DeepSeek v3 which has very small F and relatively small, restricted cross-node expert parallelism), or models with large F, in which case we can do significant cross-node EP alongside TP.
+
+\begin{takeawaybox}
+\textbf{Takeaway:} if $F < 8 * C / W_\text{node}$, expert parallelism can span 1-2 nodes with similar (slightly lower) cost to TP, or if $F > 8 * C / W_\text{node}$, we can do a significant amount of expert parallelism (up to $E$ nodes) with relatively low cost.
+\end{takeawaybox}
+
+\subsection{Pipeline Parallelism}
+
+Pipeline parallelism splits layers across nodes with an extremely low communication cost, since we are just sending small microbatches of activations every couple layers. Historically pipelining has suffered from ``pipeline bubbles'', but with new zero-bubble pipelining approaches, it is typically possible to do without.
+
+The overall communication cost of pipelining is tiny: with $N_\text{MB}$ microbatches and $N_\text{stages}$, we have $T_\text{comms per hop} = 2 \cdot B \cdot D / (W \cdot N_\text{MB})$ and $N_\text{MB} + N_\text{stages} - 2$ hops, so roughly
+
+$$T_\text{total PP comms} = \frac{2BD}{W \cdot N_\text{MB}} \cdot (N_\text{MB} + N_\text{stages} - 2)$$
+
+$$T_\text{per-layer comms} \approx 1.5 \cdot \frac{2BD}{W \cdot N_\text{layers}}$$
+
+Since we are dividing by $N_\text{layers}$, this is vastly smaller than any of the other costs. In other words, from a communication standpoint, pipelining is basically free. So why don't we just do pipelining? There are a few reasons:
+
+(1) \textbf{Code complexity:} pipelining doesn't fit nicely as nicely into automatic parallelism frameworks (like XLA's GSPMD) as other approaches. Because it introduces microbatching to hide pipeline bubbles, it changes the structure of the program, and custom zero-bubble pipeline schedules exacerbate this problem by requiring complicated interleaving of the forward and backward pass.
+
+(2) \textbf{Pipelining makes data parallelism and FSDP hard:} probably the biggest reason not to do pipelining is that it plays badly with FSDP and data parallelism. ZeRO-3 sharding in particular works badly, since it requires us to AllGather the weights on every microbatch which doesn't work when we have only $B / N_\text{microbatches}$ tokens to amortize the AllGather cost. Furthermore, during the backward pass, \emph{we can't AllReduce or ReduceScatter the gradients until the last microbatch has passed a given stage, which means we have significant non-overlapped communication time.}
+
+\begin{figure}[htb]
+\centering
+\includegraphics[width=\textwidth]{images/gpu/pipeline-bubble.png}
+\caption{An example 2 stage, 2 microbatch pipeline. F denotes a stage forward pass and B is a stage backward pass (2x the cost). G denotes the data-parallel AllReduces, which can be significantly longer than the time of a single microbatch.}
+\label{fig:pipeline-bubble}
+\end{figure}
+
+(3) \textbf{Pipeline bubbles and step imbalance:} As you can see in the (bad) pipeline schedule above, it is easy to have significant bubbles (meaning wasted compute) during a naive pipeline schedule. Above, the second stage is idle on step 0, the first stage is idle from step 2 to 3, and the second stage is again idle on the last step. While we can avoid these somewhat with careful scheduling, we still often have some bubbles. We also have to pass activations from one stage to the next on the critical path, which can add overhead:
+
+\begin{figure}[htb]
+\centering
+\includegraphics[width=\textwidth]{images/gpu/pipeline-transfer.png}
+\caption{An example pipeline showing transfer cost in red. This shifts stages relative to each other and increases the pipeline bubble overhead.}
+\label{fig:pipeline-transfer}
+\end{figure}
+
+There are workarounds for each of these issues, but they tend to be complicated to implement and difficult to maintain, but pipelining remains a technique with low communication cost relative to other methods.
+
+\textbf{Caveat about latency:} As noted before, GPUs struggle to achieve full AllReduce bandwidth even with fairly large messages. This means even if we in theory can scale e.g. expert-parallel AllToAlls across multiple nodes, we may struggle to achieve even 50\% of the total bandwidth. This means we do try to keep TP or EP within a smaller number of nodes to minimize latency overhead.
+
+\subsection{Examples}
+
+\textbf{What does DeepSeek do?} For reference, DeepSeek V3\footnote{See \texttt{https://arxiv.org/abs/2412.19437}} is trained with 2048 H800 GPUs with:
+
+\begin{itemize}
+\item 64-way Expert Parallelism (EP) spanning 8 nodes
+\item 16-way Pipeline Parallelism (PP)
+\item 2-way ZeRO-1 Data Parallelism (DP)
+\end{itemize}
+
+They had a steady state batch size of \texttt{4096 * 15360 = 62,914,560} tokens, or 30k tokens per GPU. You can see that this is already quite large, but their model is also very sparse (k=8, E=256) so you need a fairly large batch size. You can see that with 64-way EP and 16-way PP, we end up with 1024-way model parallelism in total, which means the AllReduce is done at the spine level, and because it's only 2-way, we end up with $2 / (2 - 1) = 2$ times more bandwidth in practice. This also helps reduce the cost of the final data-parallel AllReduce overlapping with the final pipeline stages.
+
+\textbf{What does LLaMA-3 do?} LLaMA-3 trains with a BS of 16M tokens on 16k GPUs, or about 1k tokens per GPU. They do:
+
+\begin{itemize}
+\item 8-way Tensor Parallelism within a node (TP)
+\item 16-way Pipeline Parallelism (PP)
+\item 128-way ZeRO-1 Data Parallelism
+\end{itemize}
+
+This is also a dense model so in general these things are pretty trivial. The 16-way PP reduces the cost of the data parallel AllReduce by 16x, which helps us reduce the critical batch size.
+
+\subsection{TLDR of LLM Scaling on GPUs}
+
+Let's step back and come up with a general summary of what we've learned so far:
+
+\begin{itemize}
+\item \textbf{Data parallelism or FSDP (ZeRO-1/3) requires a per-device batch size of about 2500 tokens per GPU}, although in theory in-network reductions + pure DP can reduce this somewhat.
+\item \textbf{Tensor parallelism is compute-bound up to about 8-ways} but we lack the bandwidth to scale much beyond this before becoming comms-bound. This mostly limits us to a single NVLink domain (i.e. single-node or need to use GB200NVL72 with to 72 GPUs).
+\item \textbf{Any form of model parallelism that spans multiple nodes can further reduce the cost of FSDP}, so we often want to mix PP + EP + TP to cross many nodes and reduce the FSDP cost.
+\item \textbf{Pipeline parallelism works well if you can handle the code complexity of zero-bubble pipelining and keep batch sizes fairly large to avoid data-parallel bottlenecks.} Pipelining usually makes ZeRO-3 impossible (since you would need to AllGather on each pipeline stage), but you can do ZeRO-1 instead.
+\end{itemize}
+
+\textbf{At a high level, this gives us a recipe for sharding large models on GPUs:}
+
+\begin{itemize}
+\item For relatively small dense models, aggressive FSDP works great if you have the batch size, possibly with some amount of pipelining or tensor parallelism if needed.
+\item For larger dense models, some combination of 1-2 node TP + many node PP + pure DP works well.
+\item For MoEs, the above rule applies but we can also do expert parallelism, which we prefer to TP generally. If $F > 8 * C / W_\text{node}$, we can do a ton of multi-node expert parallelism, but otherwise we're limited to roughly 2-node EP.
+\end{itemize}
+
+\subsection{Quiz 5: LLM rooflines}
+
+\textbf{Question 1 [B200 rooflines]:} A B200 DGX SuperPod (\textbf{not GB200 NVL72}) has 2x the bandwidth within a node (900GB/s egress) but the same amount of bandwidth in the scale-out network (400GB/s) (source: \texttt{docs.nvidia.com/dgx-superpod/} \texttt{reference-architecture-scalable-infrastructure-b200/latest/} \texttt{network-fabrics.html}). The total FLOPs are reported above. How does this change the model and data parallel rooflines?
+
+\textbf{Question 2 [How to shard LLaMA-3 70B]:} Consider LLaMA-3 70B, training in bfloat16 with fp32 optimizer state with Adam.
+
+\begin{enumerate}
+\item At a minimum, how many H100s would we need simply to store the weights and optimizer?
+\item Say we want to train on 4096 H100 GPUs for 15T tokens. Say we achieved 45\% MFU (Model FLOPs Utilization). How long would it take to train?
+\item LLaMA-3 70B has \texttt{F = 28,672} and was trained with a batch size of about 4M tokens. What is the most model parallelism we could do without being bandwidth-bound? With this plus pure DP, could we train LLaMA-3 while staying compute-bound on 4k chips? What about ZeRO-3? What about with 8-way pipelining? \emph{Note: consider both the communication cost and GPU memory usage.}
+\end{enumerate}
+
+\textbf{Question 3 [Megatron-LM hyperparams]:} Consider this figure from the Megatron-LM repository\footnote{See \texttt{https://github.com/NVIDIA/Megatron-LM}} highlighting their high MFU numbers.
+
+\begin{figure}[htb]
+\centering
+\includegraphics[width=\textwidth]{images/gpu/megatron-hparams.png}
+\caption{Megatron-LM hyperparameters showing high MFU configurations.}
+\label{fig:megatron-hparams}
+\end{figure}
+
+Note that their sequence length is 4096 everywhere. For the 16B, 70B, and 314B models, what is the per-device token batch size? Assuming data parallelism is the outermost axis and assuming bfloat16 reductions, determine whether each of these is theoretically compute-bound or bandwidth-bound, and whether there is a more optimal configuration available?

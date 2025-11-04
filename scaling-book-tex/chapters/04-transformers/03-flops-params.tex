@@ -23,6 +23,7 @@ A[B,T,\textcolor{red}{F}] \cdot W_{out}[\textcolor{red}{F}, D] & 6BTDF & DF \\[1
 
 For the generic grouped-query attention case with different \textbf{Q} and \textbf{KV} head numbers, let us assume equal head dimension H for \textbf{Q},\textbf{K},\textbf{V} projections, and estimate the cost of the \textbf{QKVO} matmuls:
 
+{\small
 \begin{equation*}
 \begin{array}{ccc}
 \textrm{operation} & \textrm{train FLOPs} & \textrm{params} \\
@@ -34,6 +35,7 @@ A[B,T,\textcolor{red}{N}, \textcolor{red}{H}] \cdot W_{O}[\textcolor{red}{N}, \t
 \hline \\ & 12BTD(N+K)H & 2D(N+K)H
 \end{array}
 \end{equation*}
+}
 
 The dot-product attention operation is more subtle, effectively being a $TH \cdot HS$ matmul batched over the $B$, $K$ dimensions, a softmax, and a $TS \cdot SH$ matmul again batched over the $B$, $K$ dimensions. We highlight the batched dims in blue:
 

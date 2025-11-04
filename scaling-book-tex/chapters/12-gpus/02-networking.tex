@@ -1,0 +1,136 @@
+\section{Networking}
+
+Networking is one of the areas where GPUs and TPUs differ the most. As we've seen, TPUs are connected in 2D or 3D tori, where each TPU is only connected to its neighbors. This means sending a message between two TPUs must pass through every intervening TPU, and forces us to use only uniform communication patterns over the mesh. While inconvenient in some respects, this also means the number of links per TPU is constant and we can scale to arbitrarily large TPU ``pods'' without loss of bandwidth.
+
+GPUs on the other hand use a more traditional hierarchical tree-based switching network. Sets of 8 GPUs called \textbf{nodes} (up to 72 for GB200\footnote{The term node is overloaded and can mean two things: the NVLink domain, aka the set of GPUs fully connected over NVLink interconnects, or the set of GPUs connected to a single CPU host. Before B200, these were usually the same, but in GB200 NVL72, we have an NVLink domain with 72 GPUs but still only 8 GPUs connected to each host. We use the term node here to refer to the NVLink domain, but this is controversial.}) are connected within 1 hop of each other using high-bandwidth interconnects called NVLinks, and these nodes are connected into larger units (called \textbf{SUs} or Scalable Units) with a lower bandwidth InfiniBand (IB) or Ethernet network using NICs attached to each GPU. These in turn can be connected into arbitrarily large units with higher level switches.
+
+\begin{figure}[htb]
+\centering
+\includegraphics[width=\textwidth]{images/gpu/superpod-diagram.png}
+\caption{A diagram showing a typical H100 network. A set of 8 GPUs is connected into a node or NVLink domain with NVSwitches (also called NVLink switches), and these nodes are connected to each other with a switched InfiniBand fabric. H100s have about 450GB/s of egress bandwidth each in the NVLink domain, and each node has 400GB/s of egress bandwidth into the IB network.}
+\label{fig:superpod-diagram}
+\end{figure}
+
+\subsection{At the node level}
+
+A GPU node is a small unit, typically of 8 GPUs (up to 72 for GB200), connected with all-to-all, full-bandwidth, low latency NVLink interconnects.\footnote{NVLink has been described to me as something like a souped-up PCIe connection, with low latency and protocol overhead but not designed for scalability/fault tolerance, while InfiniBand is more like Ethernet, designed for larger lossy networks.} Each node contains several high-bandwidth NVSwitches which switch packets between all the local GPUs. The actual node-level topology has changed quite a bit over time, including the number of switches per node, but for H100, we have 4 NVSwitches per node with GPUs connected to them in a $5 + 4 + 4 + 5$ link pattern, as shown:
+
+\begin{figure}[htb]
+\centering
+\includegraphics[width=\textwidth]{images/gpu/nvlink-nodes.png}
+\caption{Node aka NVLink domain diagrams from Pascall (P100) onward. Since Volta (V100), we have had all-to-all connectivity within a node using a set of switches. The H100 node has 4 NVSwitches connected to all 8 GPUs with 25GB/s links.}
+\label{fig:nvlink-nodes}
+\end{figure}
+
+For the Hopper generation (NVLink 4.0), each NVLink link has 25GB/s of full-duplex\footnote{Full-duplex here means 25GB/s each way, with both directions independent of each other. You can send a total of 50GB/s over the link, but at most 25GB/s in each direction.} bandwidth (50GB/s for B200), giving us $18 \times 25 = 450\text{GB/s}$ of full-duplex bandwidth from each GPU into the network. The massive NVSwitches have up to 64 NVLink ports, meaning an 8xH100 node with 4 switches can handle up to $64 \times 25\text{e}9 \times 4 = 6.4\text{TB/s}$ of bandwidth. Here's an overview of how these numbers have changed with GPU generation:
+
+\begin{table}[htb]
+\centering
+\scriptsize
+\begin{tabular}{ccccccc}
+\toprule
+\textbf{NVLink} & \textbf{NVSwitch} & \textbf{GPU} & \textbf{BW} & \textbf{Ports} & \textbf{Node BW} & \textbf{Node} \\
+\textbf{Gen} & \textbf{Gen} & \textbf{Gen} & \textbf{(GB/s)} & \textbf{/ GPU} & \textbf{(GB/s)} & \textbf{size} \\
+\midrule
+3.0 & 2.0 & Ampere & 25 & 12 & 300 & 8 \\
+4.0 & 3.0 & Hopper & 25 & 18 & 450 & 8 \\
+5.0 & 4.0 & Blackwell & 50 & 18 & 900 & 8/72 \\
+\bottomrule
+\end{tabular}
+\caption{NVLink evolution across generations. BW is full-duplex bandwidth per link. Node BW is GPU-to-GPU bandwidth within the node. Blackwell supports nodes of 8 or 72 GPUs (with 2 or 18 NVSwitches respectively).}
+\label{tab:nvlink-evolution}
+\end{table}
+
+Blackwell (B200) has nodes of 8 GPUs. GB200NVL72 support larger NVLink domains of 72 GPUs. We show details for both the 8 and 72 GPUs systems.
+
+\subsection{Quiz 2: GPU nodes}
+
+Here are some more Q/A problems on networking. I find these particularly useful to do out, since they make you work through the actual communication patterns.
+
+\textbf{Question 1 [Total bandwidth for H100 node]:} How much total bandwidth do we have per node in an 8xH100 node with 4 switches? \emph{Hint:} consider both the NVLink and NVSwitch bandwidth.
+
+\textbf{Question 2 [Bisection bandwidth]:} Bisection bandwidth is defined as the smallest bandwidth available between any even partition of a network. In other words, if split a network into two equal halves, how much bandwidth crosses between the two halves? Can you calculate the bisection bandwidth of an 8x H100 node? \emph{Hint:} bisection bandwidth typically includes flow in both directions.
+
+\textbf{Question 3 [AllGather cost]:} Given an array of B bytes, how long would a (throughput-bound) AllGather take on an 8xH100 node? Do the math for \texttt{bf16[$D_X$, F]} where \texttt{D=4096}, \texttt{F=65,536}. \emph{It's worth reading the TPU collectives section before answering this. Think this through here but we'll talk much more about collectives next.}
+
+\subsection{Beyond the node level}
+
+Beyond the node level, the topology of a GPU network is less standardized. NVIDIA publishes a reference DGX SuperPod architecture\footnote{See NVIDIA documentation: \texttt{docs.nvidia.com/dgx-superpod/} \texttt{reference-architecture-scalable-infrastructure-h100/latest/network-fabrics.html}} that connects a larger set of GPUs than a single node using InfiniBand, but customers and datacenter providers are free to customize this to their needs.\footnote{For instance, Meta trained LLaMA-3 on a datacenter network that differs significantly from this description, using Ethernet, a 3 layer switched fabric, and an oversubscribed switch at the top level.}
+
+Here is a diagram for a reference 1024 GPU H100 system, where each box in the bottom row is a single 8xH100 node with 8 GPUs, 8 400Gbps CX7 NICs (one per GPU), and 4 NVSwitches.
+
+\begin{figure}[htb]
+\centering
+\includegraphics[width=\textwidth]{images/gpu/h100-superpod.png}
+\caption{Diagram of the reference 1024 H100 DGX SuperPod with 128 nodes (sometimes 127), each with 8 H100 GPUs, connected to an InfiniBand scale-out network. Sets of 32 nodes (256 GPUs) are called `Scalable Units' or SUs. The leaf and spine IB switches provide enough bandwidth for full bisection bandwidth between nodes.}
+\label{fig:h100-superpod}
+\end{figure}
+
+\textbf{Scalable Units:} Each set of 32 nodes is called a ``Scalable Unit'' (or SU), under a single set of 8 leaf InfiniBand switches. This SU has 256 GPUs with 4 NVSwitches per node and 8 Infiniband leaf switches. All the cabling shown is InfiniBand NDR (50GB/s full-duplex) with 64-port NDR IB switches (also 50GB/s per port). \emph{Note that the IB switches have 2x the bandwidth of the NVSwitches (64 ports with 400 Gbps links).}
+
+\textbf{SuperPod:} The overall SuperPod then connects 4 of these SUs with 16 top level ``spine'' IB switches, giving us 1024 GPUs with 512 node-level NVSwitches, 32 leaf IB switches, and 16 spine IB switches, for a total of $512 + 32 + 16 = 560$ switches. Leaf switches are connected to nodes in sets of 32 nodes, so each set of 256 GPUs has 8 leaf switches. All leaf switches are connected to all spine switches.
+
+\textbf{How much bandwidth do we have?} The overall topology of the InfiniBand network (called the ``scale out network'') is that of a \textbf{fat tree}, with the cables and switches guaranteeing full bisection bandwidth above the node level (here, 400GB/s). That means if we split the nodes in half, each node can egress 400GB/s to a node in the other partition at the same time. More to the point, this means we should have a roughly constant AllReduce bandwidth in the scale out network! While it may not be implemented this way, you can imagine doing a ring reduction over arbitrarily many nodes in the scale-out network, since you can construct a ring including every one.
+
+\begin{table}[htb]
+\centering
+\small
+\begin{tabular}{ccccc}
+\toprule
+\textbf{Level} & \textbf{GPUs} & \textbf{Switches} & \textbf{Type} & \textbf{BW/Unit} \\
+ & & \textbf{per Unit} & & \textbf{(TB/s)} \\
+\midrule
+Node & 8 & 4 & NVL & 3.6 \\
+Leaf & 256 & 8 & IB & 12.8 \\
+Spine & 1024 & 16 & IB & 51.2 \\
+\bottomrule
+\end{tabular}
+\caption{H100 SuperPod bandwidth levels. BW/Unit is full-duplex bandwidth per unit. GPU-to-GPU bandwidth is 450GB/s at node level and 50GB/s at leaf/spine levels. Fat tree bandwidth is 450GB/s within node and 400GB/s between nodes.}
+\label{tab:h100-superpod-bw}
+\end{table}
+
+By comparison, a TPU v5p has about 90GB/s egress bandwidth per link, or 540GB/s egress along all axes of the 3D torus. This is not point-to-point so it can only be used for restricted, uniform communication patterns, but it still gives us a much higher TPU to TPU bandwidth that can scale to arbitrarily large topologies (at least up to 8960 TPUs).
+
+The GPU switching fabric can in theory be extended to arbitrary sizes by adding additional switches or layers of indirection, at the cost of additional latency and costly network switches.
+
+\begin{takeawaybox}
+\textbf{Takeaway}: Within an H100 node, we have a full fat tree bandwidth of 450GB/s from each GPU, while beyond the node, this drops to 400GB/s node-to-node. This will turn out to be critical for communication primitives.
+\end{takeawaybox}
+
+\textbf{GB200 NVL72s:} NVIDIA has recently begun producing new GB200 NVL72 GPU clusters that combine 72 GPUs in a single NVLink domain with full 900GB/s of GPU to GPU bandwidth. These domains can then be linked into larger SuperPods with proportionally higher (9x) IB fat tree bandwidth. Here is a diagram of that topology:
+
+\begin{figure}[htb]
+\centering
+\includegraphics[width=\textwidth]{images/gpu/gb200-superpod.png}
+\caption{A diagram showing a GB200 DGX SuperPod of 576 GPUs. Each rack at the bottom layer contains 72 GB200 GPUs.}
+\label{fig:gb200-superpod-network}
+\end{figure}
+
+Counting the egress bandwidth from a single node (the orange lines above), we have $4 \times 18 \times 400 / 8 = 3.6\text{TB/s}$ of bandwidth to the leaf level, which is 9x more than an H100 (just as the node contains 9x more GPUs). That means the critical node egress bandwidth is much, \emph{much} higher and our cross-node collective bandwidth can actually be \emph{lower} than within the node. See Appendix A for more discussion.
+
+\begin{table}[htb]
+\centering
+\small
+\begin{tabular}{lccc}
+\toprule
+\textbf{Node Type} & \textbf{GPUs} & \textbf{GPU egress} & \textbf{Node egress} \\
+ & \textbf{per node} & \textbf{BW (GB/s)} & \textbf{BW (GB/s)} \\
+\midrule
+H100 & 8 & 450 & 400 \\
+B200 & 8 & 900 & 400 \\
+GB200 NVL72 & 72 & 900 & 3600 \\
+\bottomrule
+\end{tabular}
+\caption{Node types comparison. GPU egress BW is full-duplex bandwidth from each GPU within the node. Node egress BW is full-duplex bandwidth from the entire node to the scale-out network.}
+\label{tab:node-types-comparison}
+\end{table}
+
+\begin{takeawaybox}
+\textbf{Takeaway}: GB200 NVL72 SuperPods drastically increase the node size and egress bandwidth from a given node, which changes our rooflines significantly.
+\end{takeawaybox}
+
+\subsection{Quiz 3: Beyond the node level}
+
+\textbf{Question 1 [Fat tree topology]:} Using the DGX H100 diagram above, calculate the bisection bandwidth of the entire 1024 GPU pod at the node level. Show that the bandwidth of each link is chosen to ensure full bisection bandwidth. \emph{Hint: make sure to calculate both the link bandwidth and switch bandwidth.}
+
+\textbf{Question 2 [Scaling to a larger DGX pod]:} Say we wanted to train on 2048 GPUs instead of 1024. What would be the simplest/best way to modify the above DGX topology to handle this? What about 4096? \emph{Hint: there's no single correct answer, but try to keep costs down. Keep link capacity in mind. See NVIDIA documentation at: \texttt{docs.nvidia.com/} \texttt{dgx-superpod-reference-architecture-dgx-h100.pdf} for details.}

@@ -1,0 +1,24 @@
+\section{Worked Problems}
+
+\textbf{Question 1:} take a look at this Colab/profile\footnote{\url{https://colab.research.google.com/drive/1LfLO3OTr-\_MWFPxUN36KJ3cqH0BcAoli?usp=sharing}} and figure out what looks suspicious and what's going on here. Can you tell me exactly what computations are happening and what each operation is doing? What are the true shapes of each matrix involved and how are they sharded? \emph{Try looking at the profile first without reading the code.}
+
+\begin{figure}[htb]
+\centering
+\includegraphics[width=\textwidth]{images/all-reduce-profile.png}
+\caption{Profile showing a suspicious pattern with reduce operations and all-reduce communications. The challenge is to identify the computation structure and sharding strategy from the profile alone.}
+\label{fig:all-reduce-profile}
+\end{figure}
+
+
+\textbf{Question 2:} The Transformer Colab from earlier\footnote{\url{https://colab.research.google.com/drive/1\_6krERgtolH7hbUIo7ewAMLlbA4fqEF8?usp=sharing}} implements a simple mock Transformer. Follow the instructions in the Colab and get a benchmark of the naive Transformer with GSPMD partitioning. How long does each part take? How long should it take? What sharding is being used. Try fixing the sharding! \emph{Hint: use \texttt{jax.lax.with\_sharding\_constraints} to constrain the behavior. With this fix, what's the best MXU you can get?}
+
+For reference, the initial version gets roughly 184ms / layer and the optimized profile gets 67 ms / layer. Once you've done this, try staring at the profile and see if you can answer these questions purely from the profile:
+
+\begin{itemize}
+\item What sharding strategy is this?
+\item What is the batch size, $d_\text{model}$, $d_\text{ff}$?
+\item What fraction of time is spent on attention vs. the MLP block?
+\item What fraction of time should be spent on each op at the roofline?
+\end{itemize}
+
+\textbf{Note:} since this problem was written, the XLA compiler has gotten better. The initial version is now at roughly 90ms / layer and the optimized profile is only about 10ms / layer better (80 ms / layer). Still, it's worth playing with and seeing if you can do better.

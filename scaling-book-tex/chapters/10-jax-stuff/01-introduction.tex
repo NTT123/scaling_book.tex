@@ -1,0 +1,40 @@
+\section{How Does Parallelism Work in JAX?}
+
+JAX supports three schools of thought for multi-device programming:
+
+\begin{enumerate}
+\item \textbf{Compiler, take the wheel!} Let the XLA compiler automatically partition arrays and decide what communication to add to facilitate a given program. This lets you take a program that runs on a single device and automatically run it on thousands without changing anything.
+
+\item \textbf{JAX, take the wheel!} Automatic parallelism is great, but sometimes the compiler does something crazy. Explicit sharding lets you write single-device code like usual, but have JAX handle sharding propagation (not the compiler). This means JAX can ask you for clarification when it's unclear what you want.
+
+\item \textbf{Just let me write what I mean, damnit!} While compilers are nice, they sometimes do the wrong thing and add communication you don't intend. Sometimes we want to be explicit about exactly what communication you intend to run.
+\end{enumerate}
+
+\begin{center}
+{\small
+\begin{longtable}{p{2.2cm}p{1.8cm}p{2.2cm}p{2.2cm}}
+\toprule
+\textbf{Mode} & \textbf{View?} & \textbf{Explicit sharding?} & \textbf{Explicit Collectives?} \\
+\midrule
+\endfirsthead
+\toprule
+\textbf{Mode} & \textbf{View?} & \textbf{Explicit sharding?} & \textbf{Explicit Collectives?} \\
+\midrule
+\endhead
+Auto & Global & ✗ & ✗ \\
+Explicit & Global & ✓ & ✗ \\
+Manual & Per-device & ✓ & ✓ \\
+\bottomrule
+\end{longtable}
+}
+\end{center}
+
+Correspondingly, JAX provides APIs for each of these modes:
+
+\begin{enumerate}
+\item \texttt{jax.jit} (with \texttt{Auto} mesh axes) lets you take any existing JAX function and call it with sharded inputs. JAX then uses XLA's Shardy compiler which automatically parallelizes the program. XLA will add communication for you (AllGathers, ReduceScatters, AllReduces, etc.) when needed to facilitate existing operations. While it isn't perfect, it usually does a decent job at automatically scaling your program to any number of chips without code changes.
+
+\item \texttt{jax.jit} with \texttt{Explicit} mesh axes looks similar to (1), but lets JAX handle the sharding propagation instead of XLA. That means the sharding of an array is actually part of the JAX type system, and JAX can error out when it detects ambiguous communication and lets the user resolve it.
+
+\item \texttt{jax.shard\_map} is the more manual counterpart. You get a device-local view of the program and have to write any communication you want explicitly. Have a sharded array and want the whole thing on each device? Add a \texttt{jax.lax.all\_gather}. Want to sum an array across your devices? Add a \texttt{jax.lax.psum} (an AllReduce). Programming is harder but far less likely to do something you don't want.
+\end{enumerate}

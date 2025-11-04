@@ -1,0 +1,12 @@
+\subsection{Graph Viewer}
+
+While some of the fusions above can seem complicated, the XLA Graph Viewer makes them easier to parse. For example here's the view of a fairly complicated fusion:
+
+\begin{figure}[htb]
+\centering
+\includegraphics[width=\textwidth]{images/graph-viewer.png}
+\caption{The XLA Graph Viewer showing the dataflow structure of a complex fusion operation. Each box represents an operation, with arrows showing data dependencies between operations.}
+\label{fig:graph-viewer}
+\end{figure}
+
+It's really helpful to stare at a bunch of HLO graphs and try to map HLO ops onto the code you're profiling. By hovering over a box you'll often see the line of code where the function was defined.

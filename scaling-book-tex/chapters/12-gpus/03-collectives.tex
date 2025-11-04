@@ -1,0 +1,195 @@
+\section{How Do Collectives Work on GPUs?}
+
+GPUs can perform all the same collectives as TPUs: ReduceScatters, AllGathers, AllReduces, and AllToAlls. Unlike TPUs, the way these work changes depending on whether they're performed at the node level (over NVLink) or above (over InfiniBand). These collectives are implemented by NVIDIA in the NVSHMEM\footnote{\url{https://developer.nvidia.com/nvshmem}} and NCCL\footnote{\url{https://developer.nvidia.com/nccl}} (pronounced ``nickel'') libraries. NCCL is open-sourced at \url{https://github.com/NVIDIA/nccl}. While NCCL uses a variety of implementations depending on latency requirements/topology,\footnote{See \url{https://github.com/NVIDIA/nccl/issues/1415\#issuecomment-2310650081} for details.} from here on, we'll discuss a theoretically optimal model over a switched tree fabric.
+
+\subsection{Intra-node collectives}
+
+\textbf{AllGather or ReduceScatter:} For an AllGather or ReduceScatter at the node level, you can perform them around a ring just like a TPU, using the full GPU-to-GPU bandwidth at each hop. Order the GPUs arbitrarily and send a portion of the array around the ring using the full GPU-to-GPU bandwidth.\footnote{You can also think of each GPU sending its chunk of size $\text{bytes} / N$ to each of the other $N - 1$ GPUs, for a total of $(N - 1) \times N \times \text{bytes} / N$ bytes communicated, which gives us the same result.} The cost of each hop is $T_\text{hop} = \text{bytes} / (N \times \text{GPU egress bandwidth})$, so the overall cost is
+{\small
+\begin{equation}
+T_\text{AG or RS comms} = \frac{\text{bytes} \cdot (N - 1)}{N \cdot \text{GPU egress bandwidth}} \rightarrow \frac{\text{bytes}}{\text{GPU egress bandwidth}}
+\end{equation}
+}
+
+You'll note this is exactly the same as on a TPU. For an AllReduce, you can combine an RS + AG as usual for twice the cost.
+
+\begin{figure}[htb]
+\centering
+\includegraphics[width=\textwidth]{images/gpu/all-gather.png}
+\caption{\textbf{Bandwidth-optimal 1D ring AllGather algorithm.} For B bytes, this sends $V / X$ bytes over the top-level switches $X - 1$ times. Note: This is a static version of an animated diagram in the original source showing the progression of data movement around the ring.}
+\label{fig:all-gather-ring}
+\end{figure}
+
+If you're concerned about latency (e.g. if your array is very small), you can do a tree reduction, where you AllReduce within pairs of 2, then 4, then 8 for a total of $\log(N)$ hops instead of $N - 1$, although the total cost is still the same.
+
+\begin{takeawaybox}
+The cost to AllGather or ReduceScatter an array of B bytes within a single node is about $T_\text{comms} = B \times (8 - 1) / (8 \times W_\text{GPU egress}) \approx B / W_\text{GPU egress}$. This is theoretically around $B / \text{450e9}$ on an H100 and $B / \text{900e9}$ on a B200. An AllReduce has 2x this cost unless in-network reductions are enabled.
+\end{takeawaybox}
+
+\textbf{Pop Quiz 1 [AllGather time]:} Using an 8xH100 node with 450 GB/s full-duplex bandwidth, how long does \textbf{AllGather}(\texttt{bf16}[$B_X$, $F$]) take? Let $B=1024$, $F=16{,}384$.
+
+\textbf{AllToAlls:} GPUs within a node have all-to-all connectivity, which makes AllToAlls, well, quite easy. Each GPU just sends directly to the destination node. Within a node, for B bytes, each GPU has $B / N$ bytes and sends $(B / N^2)$ bytes to $N - 1$ target nodes for a total of
+\begin{equation}
+T_\text{AllToAll comms} = \frac{B \cdot (N - 1)}{W \cdot N^2} \approx \frac{B}{W \cdot N}
+\end{equation}
+
+Compare this to a TPU, where the cost is $B / (4W)$. Thus, within a single node, we get a 2X theoretical speedup in runtime ($B / 4W$ vs. $B / 8W$).
+
+For Mixture of Expert (MoE) models, we frequently want to do a \emph{sparse or ragged AllToAll}, where we guarantee at most $k$ of $N$ shards on the output dimension are non-zero, that is to say $T_\text{AllToAll} \rightarrow K[B, N]$ where at most $k$ of $N$ entries on each axis are non-zero. The cost of this is reduced by $k/N$, for a total of about $\min(k/N, 1) \cdot B / (W \cdot N)$. For an MoE, we often pick the non-zero values independently at random, so there's some chance of having fewer than $k$ non-zero, giving us approximately $(N-1)/N \cdot \min(k/N, 1) \cdot B / (W \cdot N)$.\footnote{The true cost is actually $(1 - ((Z - 1)/Z)^K) \cdot (Z - 1)/Z$, the expected number of distinct outcomes in $K$ dice rolls, but it is very close to the approximation given. See the Appendix for more details.}
+
+\textbf{Pop Quiz 2 [AllToAll time]:} Using an 8xH100 node with 450 GB/s unidirectional bandwidth, how long does \textbf{AllToAll}$_{X\rightarrow N}$(\texttt{bf16}[$B_X$, $N$]) take? What if we know only 4 of 8 entries will be non-zero?
+
+\begin{takeawaybox}
+The cost of an AllToAll on an array of $B$ bytes on GPU within a single node is about $T_\text{comms} = (B \cdot (8 - 1)) / (8^2 \cdot W_\text{GPU egress}) \approx B / (8 \cdot W_\text{GPU egress})$. For a ragged (top-$k$) AllToAll, this is decreased further to $(B \cdot k) / (64 \cdot W_\text{GPU egress})$.
+\end{takeawaybox}
+
+\textbf{Empirical measurements:} here is an empirical measurement of AllReduce bandwidth over an 8xH100 node. The Algo BW is the measured bandwidth (bytes / runtime) and the Bus BW is calculated as $2 \cdot W \cdot (8 - 1) / 8$, theoretically a measure of the actual link bandwidth. You'll notice that we do achieve close to 370GB/s, less than 450GB/s but reasonably close, although only around 10GB/device. This means although these estimates are theoretically correct, it takes a large message to realize it.
+
+\begin{figure}[htb]
+\centering
+\includegraphics[width=\textwidth]{images/gpu/gpu-all-reduce-bw.png}
+\caption{\textbf{AllReduce throughput for an 8xH100 node with SHARP disabled.} The blue curve is the empirical link bandwidth, calculated as $2 \times \text{bytes} \times (N - 1) / (N \times \text{runtime})$ from the empirical measurements. Note that we do not get particularly close to the claimed bandwidth of 450GB/s, even with massive 10GB arrays.}
+\label{fig:gpu-all-reduce-bw}
+\end{figure}
+
+This is a real problem, since it meaningfully complicates any theoretical claims we can make, since e.g. even an AllReduce over a reasonable sized array, like LLaMA-3 70B's MLPs (of size \texttt{bf16[8192, 28672]}, or with 8-way model sharding, \texttt{bf16[8192, 3584] = 58MB}) can achieve only around 150GB/s compared to the peak 450GB/s. By comparison, TPUs achieve peak bandwidth at much lower message sizes (see Appendix B).
+
+\begin{takeawaybox}
+Although NVIDIA claims bandwidths of about 450GB/s over an H100 NVLink, it is difficult in practice to exceed 370 GB/s, so adjust the above estimates accordingly.
+\end{takeawaybox}
+
+\textbf{In network reductions:} Since the Hopper generation, NVIDIA switches have supported SHARP\footnote{``SHARP'' stands for Scalable Hierarchical Aggregation and Reduction Protocol. See \url{https://developer.nvidia.com/blog/advancing-performance-with-nvidia-sharp-in-network-computing/}} (Scalable Hierarchical Aggregation and Reduction Protocol) which allows for ``in-network reductions''. This means \emph{the network switches themselves} can do reduction operations and multiplex or ``MultiCast'' the result to multiple target GPUs:
+
+\begin{figure}[htb]
+\centering
+\includegraphics[width=\textwidth]{images/gpu/sharp-algorithm.png}
+\caption{\textbf{An AllReduce without SHARP has 2x the theoretical cost} because it has to pass through each GPU twice. In practice, speedups are only about 30\% (from NCCL 2.27.5).}
+\label{fig:sharp-algorithm}
+\end{figure}
+
+Theoretically, this close to halves the cost of an AllReduce, since it means each GPU can send its data to a top-level switch which itself performs the reduction and broadcasts the result to each GPU without having to egress each GPU twice, while also reducing network latency.
+\begin{equation}
+T_\text{SHARP AR comms} = \frac{\text{bytes}}{\text{GPU egress bandwidth}}
+\end{equation}
+
+Note that this is exact and not off by a factor of $1/N$, since each GPU egresses $B \cdot (N - 1) / N$ first, then receives the partially reduced version of its local shard (ingress of $B/N$), finishes the reductions, then egresses $B/N$ again, then ingresses the fully reduced result (ingress of $B \cdot (N - 1) / N$), resulting in exactly $B$ bytes ingressed.
+
+However, in practice we see about a 30\% increase in bandwidth with SHARP enabled, compared to the predicted 75\%. This gets us up merely to about 480GB/s effective collective bandwidth, not nearly 2x.
+
+\begin{figure}[htb]
+\centering
+\includegraphics[width=\textwidth]{images/gpu/sharp-all-reduce-cost.png}
+\caption{\textbf{Empirical measurements of AllReduce algo bandwidth with and without NVIDIA SHARP enabled within a node.} The gains amount to about 30\% throughput improvement at peak, even though algorithmically it ought to be able to achieve closer to a 75\% gain.}
+\label{fig:sharp-all-reduce-cost}
+\end{figure}
+
+\begin{takeawaybox}
+In theory, NVIDIA SHARP (available on most NVIDIA switches) should reduce the cost of an AllReduce on $B$ bytes from about $2 \times B / W$ to $B / W$. However, in practice we only see a roughly 30\% improvement in bandwidth. Since pure AllReduces are fairly rare in LLMs, this is not especially useful.
+\end{takeawaybox}
+
+\subsection{Cross-node collectives}
+
+When we go beyond the node-level, the cost is a bit more subtle. When doing a reduction over a tree, you can think of reducing from the bottom up, first within a node, then at the leaf level, and then at the spine level, using the normal algorithm at each level. For an AllReduce especially, you can see that this allows us to communicate less data overall, since after we AllReduce at the node level, we only have to egress $B$ bytes up to the leaf instead of $B \times N$.
+
+\textbf{How costly is this?} To a first approximation, because we have full bisection bandwidth, the cost of an AllGather or ReduceScatter is roughly the buffer size in bytes divided by the node egress bandwidth (400GB/s on H100) \emph{regardless of any of the details of the tree reduction.}
+\begin{equation}
+T_\text{AG or RS comms} = \frac{\text{bytes}}{W_\text{node egress}} \underset{\text{H100}}{=} \frac{\text{bytes}}{\text{400e9}}
+\end{equation}
+
+where $W_\text{node egress}$ is generally 400GB/s for the above H100 network (8x400Gbps IB links egressing each node). The cleanest way to picture this is to imagine doing a ring reduction over \emph{every node in the cluster}. Because of the fat tree topology, we can always construct a ring with $W_\text{node egress}$ between any two nodes and do a normal reduction. The node-level reduction will (almost) never be the bottleneck because it has a higher overall bandwidth and better latency, although in general the cost is
+{\scriptsize
+\begin{align}
+T_\text{total} &= \max(T_\text{comms at node}, T_\text{comms in scale-out network}) \nonumber\\
+&= \max\left[\frac{\text{bytes}}{W_\text{GPU egress}}, \frac{\text{bytes}}{W_\text{node egress}}\right]
+\end{align}
+}
+
+\paragraph{More precise derivation:} We can be more precise in noting that we are effectively doing a ring reduction at each layer in the network, which we can mostly overlap, so we have:
+\begin{equation}
+T_\text{AG or RS comms} = \text{bytes} \cdot \max_{\text{depth } i}\left[\frac{D_i - 1}{D_i \cdot W_{\text{link } i}}\right]
+\end{equation}
+
+where $D_i$ is the degree at depth $i$ (the number of children at depth $i$), $W_{\text{link } i}$ is the bandwidth of the link connecting each child to node $i$.
+
+Using this, we can calculate the available AllGather/AllReduce bandwidth as $\min_{\text{depth } i}(D_i \times W_{\text{link } i} / (D_i - 1))$ for a given topology. In the case above, we have:
+
+\begin{itemize}
+\item \textbf{Node:} $D_\text{node}$ = 8 since we have 8 GPUs in a node with $W_{\text{link } i}$ = 450GB/s. Thus we have an AG bandwidth of \texttt{450e9 * 8 / (8 - 1) = 514GB/s}.
+\item \textbf{Leaf:} $D_\text{leaf}$ = 32 since we have 32 nodes in an SU with $W_{\text{link } i}$ = 400GB/s (8x400Gbps IB links). Thus our bandwidth is \texttt{400e9 * 32 / (32 - 1) = 413GB/s}.
+\item \textbf{Spine:} $D_\text{spine}$ = 4 since we have 4 SUs with $W_{\text{link } i}$ = 12.8TB/s (from \texttt{8 * 16 * 2 * 400Gbps} links above). Our bandwidth is \texttt{12.8e12 * 4 / (4 - 1) = 17.1TB/s}.
+\end{itemize}
+
+Hence our overall AG or RS bandwidth is \texttt{min(514GB/s, 413GB/s, 17.1TB/s) = 413GB/s} at the leaf level, so in practice $T_\text{AG or RS comms} = B / \text{413GB/s}$, i.e. we have about 413GB/s of AllReduce bandwidth even at the highest level. For an AllReduce with SHARP, it will be slightly lower than this (around 400GB/s) because we don't have the $(N - 1) / N$ factor. Still, 450GB/s and 400GB/s are close enough to use as approximations.
+
+\textbf{Other collectives:} AllReduces are still 2x the above cost unless SHARP is enabled. NVIDIA sells SHARP-enabled IB switches as well, although not all providers have them. AllToAlls do change quite a bit cross-node, since they aren't ``hierarchical'' in the way AllReduces are. If we want to send data from every GPU to every other GPU, we can't use take advantage of the full bisection bandwidth at the node level. That means if we have an N-way AllToAll that spans $M = N / 8$ nodes, the cost is
+\begin{equation}
+T_\text{AllToAll comms} = \frac{B \cdot (M - 1)}{M^2 \cdot W_\text{node egress}} \approx \frac{B}{M \cdot W_\text{node egress}}
+\end{equation}
+
+which effectively has 50GB/s rather than 400GB/s of bandwidth. We go from $B / (8 \times \text{450e9})$ within a single H100 node to $B / (2 \times \text{400e9})$ when spanning 2 nodes, a more than 4x degradation.
+
+Here is a summary of the 1024-GPU DGX H100 SuperPod architecture:
+
+\begin{table}[htb]
+\centering
+\scriptsize
+\caption{DGX H100 SuperPod architecture summary showing collective bandwidths at different levels.}
+\label{tab:h100-superpod-architecture}
+\begin{tabular}{@{}lccccc@{}}
+\toprule
+\textbf{Level} & \textbf{\# GPUs} & \textbf{Degree} & \textbf{Switch BW} & \textbf{Cable BW} & \textbf{Coll. BW} \\
+               &                  & \textbf{(Children)} & \textbf{(TB/s)} & \textbf{(TB/s)} & \textbf{(GB/s)} \\
+\midrule
+Node           & 8                & 8               & 6.4             & 3.6             & 450 \\
+Leaf (SU)      & 256              & 32              & 25.6            & 12.8            & 400 \\
+Spine          & 1024             & 4               & 51.2            & 51.2            & 400 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+We use the term ``Collective Bandwidth'' to describe the effective bandwidth at which we can egress either the GPU or the node. It's also the $\text{bisection bandwidth} \times 2 / N$.
+
+\begin{takeawaybox}
+Beyond the node level, the cost of an AllGather or ReduceScatter on B bytes is roughly $B / W_\text{node egress}$, which is $B / \text{400e9}$ on an H100 DGX SuperPod, while AllReduces cost twice as much unless SHARP is enabled. The overall topology is a fat tree designed to give constant bandwidth between any two pairs of nodes.
+\end{takeawaybox}
+
+\textbf{Reductions when array is sharded over a separate axis:} Consider the cost of a reduction like
+\begin{equation}
+\textbf{AllReduce}_X(A[I_Y, J]\ \{ U_X \})
+\end{equation}
+
+where we are AllReducing over an array that is itself sharded along another axis $Y$. On TPUs, the overall cost of this operation is reduced by a factor of $1 / Y$ compared to the unsharded version since we're sending $1 / Y$ as much data per axis. On GPUs, the cost depends on which axis is the ``inner'' one (intra-node vs. inter-node) and whether each shard spans more than a single node. Assuming $Y$ is the inner axis, and the array has $\text{bytes}$ total bytes, the overall cost is reduced effectively by $Y$, but only if $Y$ spans multiple nodes:
+{\small
+\begin{align}
+T_\text{comms at node} &= \frac{\text{bytes}}{W_\text{GPU egress}} \cdot \frac{1}{\min(Y, D_\text{node})} \\
+T_\text{comms in scale-out network} &= \frac{\text{bytes}}{W_\text{node egress}} \cdot \frac{D_\text{node}}{\max(D_\text{node}, Y)} \\
+T_\text{total} &= \max(T_\text{comms at node}, T_\text{comms in scale-out network})
+\end{align}
+}
+
+where N is the number of GPUs and again $D_\text{node}$ is the number of GPUs in a node (the degree of the node). As you can see, if $Y < D_\text{node}$, we get a win at the node level but generally don't see a reduction in overall runtime, while if $Y > D_\text{node}$, we get a speedup proportional to the number of nodes spanned.
+
+If we want to be precise about the ring reduction, the general rule for a tree \textbf{AllGather}$_X$($A_Y$ \{ $U_X$ \}) (assuming Y is the inner axis) is
+\begin{equation}
+T_\text{AR or RS comms} = \text{bytes} \cdot \max_{\text{depth } i}\left[\frac{D_i - 1}{D_i \cdot \max(Y, S_{i-1}) \cdot W_{\text{link } i}}\right]
+\end{equation}
+
+where $S_i$ is $M \times N \times \ldots$, the size of the subnodes below level $i$ in the tree. This is roughly saying that the more GPUs or nodes we span, the greater our available bandwidth is, but only within that node.
+
+\textbf{Pop Quiz 3 [Sharding along 2 axes]:} Say we want to perform \textbf{AllGather}$_X$(\texttt{bf16}[$D_X$, $F_Y$]) where $Y$ is the inner axis over a single SU (256 chips). How long will this take as a function of $D$, $F$, and $Y$?
+
+\begin{takeawaybox}
+When we have multiple axes of sharding, the cost of the outer reduction is reduced by a factor of the number of nodes spanned by the inner axis.
+\end{takeawaybox}
+
+\subsection{Quiz 4: Collectives}
+
+\textbf{Question 1 [SU AllGather]:} Consider only a single SU with M nodes and N GPUs per node. Precisely how many bytes are ingressed and egressed by the node level switch during an AllGather? What about the top-level switch?
+
+\textbf{Question 2 [Single-node SHARP AR]:} Consider a single node with N GPUs per node. Precisely how many bytes are ingressed and egressed by the switch during an AllReduce using SHARP (in-network reductions)?
+
+\textbf{Question 3 [Cross-node SHARP AR]:} Consider an array \texttt{bf16}[$D_X$, $F_Y$] sharded over a single node of N GPUs. How long does \textbf{AllReduce}(\texttt{bf16}[$D$, $F_Y$] \{ $U_X$ \}) take? You can assume we do in-network reductions. Explain how this differs if we have more than a single node?
+
+\textbf{Question 4 [Spine level AR cost]:} Consider the same setting as above, but with $Y = 256$ (so the AR happens at the spine level). How long does the AllReduce take? Again, feel free to assume in-network reductions.
+
+\textbf{Question 5 [2-way AllGather cost]:} Calculate the precise cost of an AllGather of $B$ bytes over exactly 2 nodes. \emph{Make sure to calculate the precise cost and not the approximation, and consider both the intra-node and cross-node cost.}

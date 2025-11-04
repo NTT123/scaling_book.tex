@@ -23,5 +23,11 @@ build/
 # Generated PDFs
 *.pdf
 
+# Synced images from submodule (generated during build)
+scaling-book-tex/images/*.png
+scaling-book-tex/images/*.gif
+scaling-book-tex/images/gpu/*.png
+scaling-book-tex/images/gpu/*.gif
+
 # macOS
 .DS_Store

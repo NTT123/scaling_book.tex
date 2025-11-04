@@ -1,0 +1,130 @@
+\subsection{shard\_map: explicit parallelism control over a program}
+
+While Shardy is the ``compiler take the wheel'' mode, jax \texttt{shard\_map}\footnote{See JAX shard\_map documentation at: \texttt{jax.readthedocs.io/en/latest/} \texttt{jep/14273-shard-map.html}} puts everything in your hands. You specify the sharding of the inputs, like in \texttt{jax.jit}, but then you write all communication explicitly. Whereas \texttt{jax.jit} leaves you with a global cross-device view of the program, \texttt{shard\_map} gives you a local per-device view.
+
+Here's an example. Try to reason about what this function does:\footnote{If you want to play with this yourself in a colab by emulating a mesh, you can do so using the following cell \texttt{import jax; jax.config.update('jax\_num\_cpu\_devices', 8)}}
+
+\begin{lstlisting}[language=Python, basicstyle=\small\ttfamily, breaklines=true]
+import jax
+import jax.numpy as jnp
+import jax.sharding as shd
+
+mesh = jax.make_mesh((2, 4), ('x', 'y'), (shd.AxisType.Explicit, shd.AxisType.Explicit))
+jax.set_mesh(mesh)
+
+x = jnp.arange(0, 512, dtype=jnp.int32, out_sharding=P(('x', 'y')))
+
+# This function will operate on 1/8th of the array.
+@jax.shard_map(in_specs=P(('x', 'y')), out_specs=P())
+def slice_and_average(x):
+  assert x.shape == (512 // 8,)
+  return jax.lax.pmean(x[:4], axis_name=('x', 'y'))
+
+out = slice_and_average(x)
+assert out.shape == (4,)
+\end{lstlisting}
+
+\textbf{What does this do?} \texttt{slice\_and\_average} is run on each TPU with 1/8th of the array, from which we slice the first 4 elements and average them across the full mesh. This means we're effectively doing \texttt{mean(x[:4], x[64:68], x[128:132], ...)}.  This is pretty cool, because that's not an easy operation to express in JAX otherwise.
+
+\textbf{Why do this instead of jax.jit?} If we'd used \texttt{jax.jit}, \texttt{slice\_and\_average} would have seen a global view of the array (the full \texttt{[512,]} array). We'd have had to slice out this non-uniform slice and then perform an average which XLA would have had to interpret correctly. XLA might have added the wrong communication or gotten confused. Here we see the local view and write only the communication we need.
+
+\textbf{Example [Collective Matmul]:} To take a more realistic example, say we to implement model parallelism where the activations are initially model sharded, i.e. $A[B_X, D_Y] * W[D, F_Y] \rightarrow Out[B_X, F_Y]$. Naively, we would do this by AllGathering A first followed by a local matrix multiplication:
+
+\begin{enumerate}
+\item $A[B_X, D] = \textbf{AllGather}_Y(A[B_X, D_Y])$
+\item $Out[B_X, F_Y] = A[B_X, D] *_D W[D, F_Y]$
+\end{enumerate}
+
+Sadly, this is bad because it doesn't allow us to overlap the communication with the computation. Overlapping them can be done with a ``collective matmul'', as described in Wang et al. 2023.\footnote{Wang, Z., Yi, X., Zhong, L., and Yang, C. (2023). Overlap Communication with Dependent Computation via Decomposition in Large Deep Learning Models. In \emph{Proceedings of the 28th ACM International Conference on Architectural Support for Programming Languages and Operating Systems, Volume 2} (pp. 93--106). ACM.} The algorithm is basically as follows:
+
+\begin{itemize}
+\item For each Y shard, perform a matmul of the local chunk of A with the local chunk of W, producing a result of shape \texttt{[B / X, F / Y]}. Simultaneously, permute A so you get the next chunk locally, perform the matmul, and sum the result.
+\end{itemize}
+
+We can implement that quite easily with \texttt{shard\_map}:
+
+\begin{lstlisting}[language=Python, basicstyle=\small\ttfamily, breaklines=true]
+import functools
+
+import jax
+import jax.numpy as jnp
+import jax.sharding as shd
+import numpy as np
+
+mesh = jax.make_mesh(axis_shapes=(2, 4), axis_names=('X', 'Y'),
+                                       axis_types=(shd.AxisType.Explicit, shd.AxisType.Explicit))
+jax.set_mesh(mesh)
+
+B, D, F = 1024, 2048, 8192
+A = jnp.arange(np.prod((B, D))).reshape((B, D))
+W = jnp.arange(np.prod((D, F))).reshape((D, F))
+
+A = jax.device_put(A, jax.P('X', 'Y'))
+W = jax.device_put(W, jax.P(None, 'Y'))
+
+@functools.partial(jax.jit, out_shardings=jax.P('X', 'Y'))
+def matmul(lhs, rhs):
+  return lhs @ rhs
+
+def collective_matmul_allgather_lhs_contracting(lhs, rhs):
+  # lhs is the looped operand; rhs is the local operand
+  axis_size = jax.lax.axis_size('Y')  # axis_size = 4 for this example
+  idx = jax.lax.axis_index('Y')
+
+  chunk_size = lhs.shape[1]
+  assert rhs.shape[0] % chunk_size == 0
+
+  def f(i, carrys):
+    accum, lhs = carrys
+    rhs_chunk = jax.lax.dynamic_slice_in_dim(rhs, (idx + i) % axis_size * chunk_size, chunk_size)
+    # Matmul for a chunk
+    update = lhs @ rhs_chunk
+    # Circular shift to the left
+    lhs = jax.lax.ppermute(
+        lhs,
+        axis_name='Y',
+        perm=[(j, (j - 1) % axis_size) for j in range(axis_size)]
+    )
+    return accum + update, lhs
+
+  accum = jnp.zeros((lhs.shape[0], rhs.shape[1]), dtype=lhs.dtype)
+  accum = jax.lax.pvary(accum, ('X', 'Y'))
+  accum, lhs = jax.lax.fori_loop(0, axis_size - 1, f, (accum, lhs), unroll=True)
+
+  # Compute the last chunk after the final permute to leave lhs in the state we found it
+  i = axis_size - 1
+  rhs_chunk = jax.lax.dynamic_slice_in_dim(rhs, (idx + i) % axis_size * chunk_size, chunk_size)
+  update = lhs @ rhs_chunk
+  return accum + update
+
+jit_sharded_f = jax.jit(jax.shard_map(
+  collective_matmul_allgather_lhs_contracting,
+  in_specs=(jax.P('X', 'Y'), jax.P(None, 'Y')), out_specs=jax.P('X', 'Y')))
+
+shmapped_out = jit_sharded_f(A, W)
+expected_out = matmul(A, W)
+
+np.testing.assert_array_equal(shmapped_out, expected_out)
+\end{lstlisting}
+
+This is pretty neat! We can benchmark this and see that it's also a lot faster! Here's the profile\footnote{See profile: \texttt{imgur.com/a/e9I6SrM}} with the default jit matmul which takes 311us with a big blocking AllGather at the beginning:
+
+\begin{figure}[htb]
+\centering
+\includegraphics[width=\textwidth]{images/not-overlapped.png}
+\caption{Profile showing non-overlapped computation with blocking AllGather taking 311us. The large communication operation at the start blocks all computation.}
+\label{fig:not-overlapped}
+\end{figure}
+
+And here's the version\footnote{See profile: \texttt{imgur.com/a/21iy0Sv}} above that takes 244 us. You can see the profile doesn't have the AllGather. It's all useful work! Our FLOPs utilization is also a lot higher.
+
+\begin{figure}[htb]
+\centering
+\includegraphics[width=\textwidth]{images/overlapped.png}
+\caption{Profile showing overlapped computation taking 244us. Communication is interleaved with computation, eliminating the blocking AllGather and achieving much higher FLOPs utilization.}
+\label{fig:overlapped}
+\end{figure}
+
+It's also worth noting that the matmul time with no sharding on the contracting dimension is 224us,\footnote{See unsharded baseline profile: \texttt{imgur.com/a/i3gNKfq}} so we're remarkably close to the unsharded baseline here. This is a good example of the kind of performance engineering you might end up doing to improve TPU utilization.
+
+For more \texttt{shard\_map} examples, see the documentation.\footnote{\scriptsize JAX docs: \texttt{jax.readthedocs.io/en/latest/notebooks/shard\_map.html}}

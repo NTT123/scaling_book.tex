@@ -6,7 +6,7 @@
 
 \textbf{Question 3:} How many FLOPs are involved in performing $A[I,J,K,L] * B[I,J,M,N,O] \rightarrow C[K,L,M,N,O]$?
 
-\textbf{Question 4:} What is the arithmetic intensity of self-attention (ignoring the Q/K/V/O projections)? \textit{Give the answer as a function of the Q and KV lengths T and S.} At what context length is attention FLOPs-bound? Given the HBM bandwidth of our TPUs, plot the effective relative cost of attention to the FFW block as the context length grows.
+\textbf{Question 4:} What is the arithmetic intensity of self-attention (ignoring the Q/K/V/O projections)? \textit{Give the answer as a function of the Q and KV lengths T and S.} At what context length is attention compute-bound? Given the HBM bandwidth of our TPUs, plot the effective relative cost of attention to the FFW block as the context length grows.
 
 \textbf{Question 5:} At what sequence length are self-attention FLOPs equal to the QKVO projection FLOPs?
 

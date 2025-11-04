@@ -1,0 +1,9 @@
+\section{Worked Problems}
+
+Here are a few worked problems. Some of these repeat things that are worked above, but might be pedagogically useful.
+
+\textbf{Question 1:} How many FLOPs does each forward pass for LLaMA 3-405B use per-token? Assuming we're FLOPs bound, what is a lower bound on a single forward pass on N chips on TPU v5e? What if we're comms bound? \emph{Ignore the fact that the model does not fit on a single chip.}
+
+\textbf{Question 2:} Assume we want to serve LLaMA 3-8B with BS240 using int8 weights and int8 KV caches. How many bytes are used by (a) model parameters (b) KV caches and (c) peak working activations (roughly)? What's the smallest topology we can run this on?
+
+\textbf{Question 3:} How would you serve LLaMA 3-405B on TPU v5e? Assume int8 weights and bfloat16 FLOPs. Let's say we have a firm limit of 15ms / token, what's the highest throughput configuration we could achieve? What is the theoretical minimum step time?

@@ -1,6 +1,6 @@
 \section{Counting parameters and FLOPs}
 
-\textbf{Question:} From this table, can we calculate the LLaMA 3-70B parameter count? Let's apply the content of Section~\ref{chap:transformers} and see if we can get 70B!
+\textbf{Question:} From this table, can we calculate the LLaMA 3-70B parameter count? 🤫 Let's apply the content of Section~\ref{chap:transformers} and see if we can get 70B!
 
 {\scriptsize
 \setlength{\tabcolsep}{1.5pt}
@@ -8,11 +8,11 @@
 \toprule
 \textbf{param} & \textbf{formula} & \textbf{count} \\
 \midrule
-FFW params & d\_model * d\_ff * 3 (gelu + out-proj) * n\_layers & 8,192 * 8,192 * 3.5 * 3 * 80 = \textbf{56.3e9} \\
+FFW params & d\_model * d\_ff * 3 (for gelu + out-projection) * n\_layers & 8,192 * 8,192 * 3.5 * 3 * 80 = \textbf{56.3e9} \\
 \addlinespace
-Vocab params & 2 (input \& output emb.) * n\_embeddings * d\_model & 2 * 128,256 * 8,192 = \textbf{2.1e9} \\
+Vocab params & 2 (input and output embeddings) * n\_embeddings * d\_model & 2 * 128,256 * 8,192 = \textbf{2.1e9} \\
 \addlinespace
-Attention params & n\_layers * [ 2 (q emb. \& concat. out proj.) * d\_model * n\_heads * d\_qkv + 2 (k \& v) * d\_model * n\_kv\_heads * d\_qkv] & 80 * (2 * 8,192 * 64 * 128 + 2 * 8,192 * 8 * 128) = \textbf{12e9} \\
+Attention params & n\_layers * [ 2 (for q embedding and concatenated output projection) * d\_model * n\_heads * d\_qkv + 2 (for k and v) * d\_model * n\_kv\_heads * d\_qkv] & 80 * (2 * 8,192 * 64 * 128 + 2 * 8,192 * 8 * 128) = \textbf{12e9} \\
 \addlinespace
  & & 56.3e9 + 2.1e9 + 12e9 = \textbf{70.4e9} \\
 \bottomrule

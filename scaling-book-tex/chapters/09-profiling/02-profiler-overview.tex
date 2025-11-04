@@ -1,0 +1,44 @@
+\section{The JAX Profiler: A Multi-Purpose TPU Profiler}
+
+JAX provides a multi-purpose TPU profiler with a bunch of useful tools for understanding what's happening on the TPU when a program is run. You can use the \texttt{jax.profiler} module to trace a program as it's running and record everything from the duration of each subcomponent, the HLO of each program, memory usage, and more. For example, this code will dump a trace to a file in \texttt{/tmp/tensorboard} that can be viewed in TensorBoard\footnote{See \url{https://docs.jax.dev/en/latest/profiling.html\#tensorboard-profiling} for a step-by-step guide.}.
+
+\begin{lstlisting}[language=Python, basicstyle=\small\ttfamily, breaklines=true]
+import jax
+with jax.profiler.trace("/tmp/tensorboard"):
+  key = jax.random.key(0)
+  x = jax.random.normal(key, (1024, 1024))
+  y = x @ x
+  y.block_until_ready()
+
+# Now you can load TensorBoard in a Google Colab with
+#
+# !pip install tensorboard tensorboard-plugin-profile
+# %load_ext tensorboard
+# %tensorboard --logdir=/tmp/tensorboard
+#
+# or externally with
+#
+# > tensorboard --logdir=/tmp/tensorboard
+#
+\end{lstlisting}
+
+Here's an overview of what you can do in the profiler:
+
+\begin{figure}[htb]
+\centering
+\includegraphics[width=\textwidth]{images/xprof-overview.png}
+\caption{Overview of the TensorBoard profiler interface showing the main tabs and functionality available for analyzing TPU program performance.}
+\label{fig:xprof-overview}
+\end{figure}
+
+Once in TensorBoard, the profiler has a few key tabs that help you understand your program:
+
+\begin{enumerate}
+\item \textbf{Trace Viewer} shows a detailed timeline of what's actually happening on the TPU as a timeline.
+\item \textbf{Graph Viewer} shows the HLO graph, letting you see what parts of the program feed into each other and how things are sharded.
+\item \textbf{Memory Profile and Memory Viewer:} these show how much memory your program is using.
+\end{enumerate}
+
+While it's slightly difficult to share profiles, a Perfetto link\footnote{\scriptsize\url{https://ui.perfetto.dev/\#!/?s=fa9f13b487bde622707c1a503f9227c34594760a}} contains at least the Trace Viewer component for a simple Transformer.
+
+An interactive Colab\footnote{\url{https://colab.research.google.com/drive/1\_6krERgtolH7hbUIo7ewAMLlbA4fqEF8?usp=sharing}} lets you generate the full JAX/TensorBoard trace and play around with it.

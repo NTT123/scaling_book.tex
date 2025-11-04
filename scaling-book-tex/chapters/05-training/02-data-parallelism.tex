@@ -54,30 +54,30 @@ As in the table above, let $C$ = per-chip FLOPs, $W_{\text{ici}}$ = \textbf{bidi
 
 \textit{Communication time:} From a previous section we know that the time required to perform an AllReduce in a 1D mesh depends only on the total bytes of the array being AllReduced and the ICI bandwidth $W_\text{ici}$;~ specifically the AllReduce time is $2 \cdot \text{total bytes} / W_\text{ici}$.~ Since we need to AllReduce for both $W_\text{in}$ and $W_\text{out}$,~ we have 2 AllReduces per layer. Each AllReduce is for a weight matrix, i.e. an array of $DF$ parameters, or $2DF$ bytes. Putting this all together, the total time for the AllReduce in a single layer is
 
-$$\begin{align}
+\begin{align}
 T_\text{comms} &= \frac{2 \cdot 2 \cdot 2 \cdot D \cdot F}{W_\text{ici}}.
-\end{align}$$
+\end{align}
 
 \textit{Matmul time:} Each layer comprises two matmuls in the forward pass, or four matmuls in the backwards pass, each of which requires $2(B/X)DF$ FLOPs. Thus, for a single layer in the backward pass, we have
 
-$$\begin{align}
+\begin{align}
 T_\text{math} &= \frac{2 \cdot 2 \cdot 2 \cdot B \cdot D \cdot F}{X \cdot C}
-\end{align}$$
+\end{align}
 
 Since we overlap, the total time per layer is the max of these two quantities:
 
-$$\begin{aligned}
+\begin{align*}
 T &\approx \max(\frac{8 \cdot B \cdot D \cdot F}{X \cdot C}, \frac{8 \cdot D \cdot F}{W_\text{ici}}) \\
 T &\approx 8 \cdot D \cdot F \cdot \max(\frac{B}{X \cdot C}, \frac{1}{W_\text{ici}})
-\end{aligned}$$
+\end{align*}
 
 We become compute-bound when $T_\text{math}/T_\text{comms} > 1$,~ or when
 
-$$\begin{align}
+\begin{align}
 \frac{B}{X} > \frac{C}{W_\text{ici}}.
-\end{align}$$
+\end{align}
 
-The upshot is that, to remain compute-bound with data parallelism, we need the per-device batch size $B / X$ to exceed the ICI operational intensity, $C / W_\text{ici}$.~ This is ultimately a consequence of the fact that the computation time scales with the per-device batch size, while the communication time is independent of this quantity (since we are transferring model weights). Note the resemblance of the $B > C/W_\text{ici}$ condition to the single-device compute-bound rule $B > 240$;~ in that case as well, the rule came from the fact that computation time scaled with batch size while data-transfer size was (in the $B \ll F, D$ regime) independent of batch size.
+The upshot is that, to remain compute-bound with data parallelism, we need the per-device batch size $B / X$ to exceed the ICI operational intensity, $C / W_\text{ici}$.~ This is ultimately a consequence of the fact that the computation time scales with the per-device batch size, while the bandwidth-bound time is independent of this quantity (since we are transferring model weights). Note the resemblance of the $B > C/W_\text{ici}$ condition to the single-device compute-bound rule $B > 240$;~ in that case as well, the rule came from the fact that computation time scaled with batch size while data-transfer size was (in the $B \ll F, D$ regime) independent of batch size.
 
 Let's put in some real numbers to get a sense of scale. For TPUv5p, \texttt{C=4.6e14} and \texttt{W=2 * 9e10} for 1D data parallelism over ICI, so \textbf{our batch size per chip must be at least 2,550 to avoid being communication-bound}. Since we can do data parallelism over multiple axes, if we dedicate all three axes of a TPUv5p pod to pure data parallelism, we 3x our bandwidth $W_\text{ici}$ and can scale down to only BS=850 per TPU or 7.6M tokens per batch per pod (of 8960 chips)! \textbf{This tells us that it's fairly hard to become bottlenecked by pure data parallelism!}
 

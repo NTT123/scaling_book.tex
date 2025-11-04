@@ -1,0 +1,57 @@
+\chapter{Conclusions and Further Reading}
+\label{chap:conclusion}
+
+\textbf{Thank you for reading this set of essays and congratulations on making it all the way to the end.} Before we conclude, a few acknowledgments:
+
+\section{Acknowledgments}
+
+This document represents a significant collective investment from many people at Google DeepMind, who we'd like to briefly acknowledge!
+
+\begin{itemize}
+\item James Bradbury, Reiner Pope, and Blake Hechtman originally derived many of the ideas in this manuscript, and were early to understanding the systems view of the Transformer.
+\item Sholto Douglas wrote the first version of this doc and is responsible for kicking off the project. He is more than anyone responsible for the overall narrative of this doc.
+\item Jacob Austin led the work of transforming this first version from rough notes into a more polished and comprehensive artifact. He did much of the work of editing, formatting, and releasing this document, and coordinated contributions from other authors.
+\item Most of the figures and animations were made by Anselm Levskaya and Charlie Chen.
+\item Charlie Chen wrote the inference section and drew many of the inference figures.
+\item Roy Frostig helped with publication, editing, and many other steps of the journey.
+\end{itemize}
+
+We'd also like to thank many others gave critical feedback throughout the process, in particular Zak Stone, Nikhil Sethi, Caitlin Stanton, Alex Dimitriev, Sridhar Lakshmanamurthy, Albert Magyar, Diwakar Gupta, Jeff Dean, Corry Wang, Matt Johnson, Peter Hawkins, and many others. Thanks to Ruiqi Gao for help with the HTML formatting.
+
+\textbf{Thank you all!}
+
+Before you go, you might also enjoy reading the new Section~\ref{chap:gpus} on NVIDIA GPUs!
+
+\section{Further Reading}
+
+There is a bunch of related writing, including the following:
+
+\begin{itemize}
+\item \textbf{TPU Deep Dive}\footnote{See: \texttt{henryhmko.github.io/posts/tpu/tpu.html}}: a wonderful in-depth look at the TPU architecture in the spirit of this book.
+
+\item \textbf{Making Deep Learning Go Brrrr From First Principles}\footnote{See: \texttt{horace.io/brrr\_intro.html}}: a more GPU and PyTorch-focused tutorial on LLM rooflines and performance engineering.
+
+\item \textbf{Writing TPU Kernels with Pallas}\footnote{See: \texttt{jax.readthedocs.io/en/latest/pallas/tpu/details.html}}: increasingly, TPU programming involves writing custom kernels in Pallas. This series discusses how to write kernels and many lower level TPU details that aren't mentioned here.
+
+\item \textbf{How to Optimize a CUDA Matmul Kernel for cuBLAS-like Performance: a Worklog}\footnote{See: \texttt{siboehm.com/articles/22/CUDA-MMM}}: while GPU and CUDA specific, this is an excellent blog post showing how to optimize a matmul kernel in CUDA. This might be a good deep dive into how TPUs and GPUs are different.
+
+\item \textbf{Distributed arrays and automatic parallelization}\footnote{See JAX documentation at: \texttt{jax.readthedocs.io/en/latest/notebooks/} \texttt{Distributed\_arrays\_and\_automatic\_parallelization.html}}: this is a really nice guide to parallelism APIs in JAX and is a good way to learn how to actually implement some of the ideas we've discussed here.
+
+\item \textbf{Rafi Witten's High Performance LLMs 2024 Class}\footnote{See: \texttt{github.com/rwitten/HighPerfLLMs2024}}: our former colleague Rafi gave a great course on TPU performance engineering and the slides are all on GitHub. This covers a bunch of things in more depth than we do here.
+
+\item \textbf{[2211.05102] Efficiently Scaling Transformer Inference}\footnote{arXiv preprint: \texttt{arxiv.org/abs/2211.05102}}: a detailed paper on the mathematics of Transformer inference. This is the inspiration for a lot of this document.
+
+\item \textbf{Huggingface Ultra-Scale Playbook}\footnote{See: \texttt{huggingface.co/spaces/nanotron/ultrascale-playbook}}: something of a GPU analog to this book, this talks more at depth about how PyTorch implements parallelism techniques and memory-saving techniques during training.
+
+\item \textbf{Transformer Inference Arithmetic}\footnote{See: \texttt{kipp.ly/transformer-inference-arithmetic/}}: a blog with many of the same ideas as this book and some excellent illustrations.
+
+\item \textbf{Stanford CS336 Slides and Videos}\footnote{See: \texttt{stanford-cs336.github.io/spring2025/index.html\#coursework}}: a fantastic Stanford course covering many details of LLM training and serving, with some useful exercises. Assignments 1 and 2 are particularly relevant.
+
+\item \textbf{Stas Bekman's ML Engineering Handbook}\footnote{See: \texttt{github.com/stas00/ml-engineering}}: a highly practical guide to ML infrastructure, covering topics not addressed in this book like how to negotiate with cloud providers, cluster management, and empirical measurements of GPU throughput.
+\end{itemize}
+
+There remains a lot of room for comprehensive writing in this area, so we hope this manuscript encourages more of it! We also believe that this is a fruitful area to study and research. In many cases, it can be done even without having many hardware accelerators on hand.
+
+\section{Feedback}
+
+Please leave comments or questions so that we can improve this further. You can reach our corresponding author, Jacob Austin, at jaaustin [at] google [dot] com, or suggest edits by posting issues, pull requests, or discussions on GitHub.\footnote{See: \texttt{github.com/jax-ml/scaling-book}}

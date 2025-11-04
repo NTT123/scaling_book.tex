@@ -1,0 +1,57 @@
+\section{What's the LLaMA Serving Story?}
+
+Let's remind ourselves what LLaMA 3-70B looks like (see Section~\ref{chap:llama3} for reference):
+
+\begin{center}
+\begin{longtable}{p{5cm}c}
+\toprule
+\textbf{hyperparam} & \textbf{value} \\
+\midrule
+\endfirsthead
+\toprule
+\textbf{hyperparam} & \textbf{value} \\
+\midrule
+\endhead
+$n_\text{layers}$ (L) & 80 \\
+$d_\text{model}$ (D) & 8,192 \\
+$d_{ff}$ (F) & 28,672 \\
+$n_\text{heads}$ (N) & 64 \\
+$n_\text{kv heads}$ (K) & 8 \\
+$d_\text{qkv}$ (H) & 128 \\
+$n_\text{embeddings}$ (V) & 128,256 \\
+\bottomrule
+\end{longtable}
+\end{center}
+
+Let's start with a simple question: \textbf{what hardware should we serve on?} The answer is basically, whichever is cheapest in FLOPs / dollar.\footnote{This isn't always true, sometimes more HBM or ICI bandwidth is critical rather than FLOPs, but this is a good heuristic.} For this reason, we typically want to serve on TPU v5e, our current dedicated inference chip (cost comes from Google Cloud pricing as of February 2025):
+
+\begin{center}
+{\small
+\begin{longtable}{p{2.2cm}p{2.2cm}p{2.2cm}p{1.8cm}}
+\toprule
+\textbf{TPU type} & \textbf{bfloat16 FLOPs/s} & \textbf{Google Cloud USD / hour} & \textbf{FLOPs / \$} \\
+\midrule
+\endfirsthead
+\toprule
+\textbf{TPU type} & \textbf{bfloat16 FLOPs/s} & \textbf{Google Cloud USD / hour} & \textbf{FLOPs / \$} \\
+\midrule
+\endhead
+H100 & 9.9e14 & \$10.8 & 3.3e17 \\
+v5p & 4.59e14 & \$4.2 & 3.9e17 \\
+v5e & 1.97e14 & \$1.2 & \textbf{5.8e17} \\
+\bottomrule
+\end{longtable}
+}
+\end{center}
+
+Each TPU v5e has 16GB of HBM which will require us to shard our model fairly aggressively. Let's start by thinking about some basic quantities that might matter for us:
+
+\textbf{Question:} How large are LLaMA 3-70B's KV caches per token? \emph{You can assume we store them in int8. This determines how large our batch size can be on a given topology.}
+
+\vspace{1em}
+
+\textbf{Question:} Let's say we want to serve L3 70B at batch size 32 and 8192 sequence length with everything (params and KVs) in int8. How much total memory will this use? What's the smallest slice we could serve this on?
+
+\vspace{1em}
+
+\textbf{Question:} At this batch size and quantization on a TPU v5e \texttt{4x2}, roughly what latency would we expect per decode step? What throughput (tokens / sec / chip). What about a \texttt{4x4}? \emph{Assume we perform our FLOPs in bfloat16 and everything is fully sharded.}

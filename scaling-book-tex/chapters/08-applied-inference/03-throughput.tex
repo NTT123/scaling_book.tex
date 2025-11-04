@@ -1,0 +1,39 @@
+\subsection{Thinking about throughput}
+
+Let's spend a little time thinking purely about throughput. When we optimize for throughput, we want to be compute bound, meaning we come close to utilizing all the TPU MXU capacity. Typically that means we want the batch size to be as large as possible, so we are doing as much work as possible.
+
+\textbf{Question:} On TPU v5e, using bfloat16 weights and activations, how large do our batch sizes need to be for us to be compute-bound in our matmuls? What if we do int8 weights but perform our FLOPs in bfloat16? What about int8 weights with int8 FLOPs?
+
+\vspace{1em}
+
+\textbf{Question:} What is the smallest TPU v5e topology we could serve LLaMA 3-70B on using bfloat16, int8, and int4 (both KVs and parameters) with 8k context? \emph{You can think of KV caches as negligibly small for this one.}
+
+\vspace{1em}
+
+\textbf{Question:} Assume we use the largest batch size that fits on these topologies, what latency we could expect for each generate step?
+
+\vspace{1em}
+
+\begin{takeawaybox}
+\textbf{Takeaway}: we can always lower bound decode latency by asking how long it takes to load all the model's parameters from HBM into the MXU. When our KV caches are small, you can think about each layer as just loading the weights chunk-by-chunk and then discarding them. Unless we're using large batch sizes or lots of inter-device comms, this is often a reasonable bound (within 1.5x). When our batch size is bigger, we need to model the KV cache loading as well, since that dominates the parameters.
+\end{takeawaybox}
+
+Likewise, in the FLOPs-bound regime (e.g. training or big-batch inference), we can use the $\text{Total FLOPs} / (N \cdot C) = 2 \cdot \text{param count} \cdot B / (N \cdot C)$ lower bound, which assumes no communication.
+
+\vspace{1em}
+
+\textbf{Question:} For each of these, what throughput per chip does this give us (in terms of queries / chip)? \emph{You can assume our median decode length is 512 tokens.}
+
+\vspace{1em}
+
+\textbf{Question:} How would our peak throughput change if we doubled our topology for each of the above examples?
+
+\vspace{1em}
+
+\textbf{Question:} Now let's dig into the question of sharding. Let's say we wanted to serve in bfloat16 on a TPU v5e 4x8. What sharding would we use for our model on a TPU v5e 4x8 during generation? Can we avoid being communication bound?
+
+\vspace{1em}
+
+\begin{takeawaybox}
+\textbf{Tip}: the maximum amount of useful model parallelism depends on $d_{ff}$ and the number of axes over which you're sharding your model. The maximum value usually ranges between 8 and 32 depending on the model size. You can scale beyond this limit to improve latency at some throughput cost.
+\end{takeawaybox}

@@ -1,0 +1,64 @@
+\subsection{Explicit sharding mode}
+
+Explicit sharding (or ``sharding in types'') looks a lot like automatic sharding, but sharding propagation happens at the JAX level! Each JAX operation has a sharding rule that takes the shardings of the op's arguments and produces a sharding for the op's result. You can see the resulting sharding using \texttt{jax.type\-of}:
+
+\begin{lstlisting}[language=Python, basicstyle=\small\ttfamily, breaklines=true]
+import jax
+import jax.numpy as jnp
+import jax.sharding as shd
+
+# Running on an TPU v5e 2x2. This assigns names to the two physical axes of the hardware.
+mesh = jax.make_mesh(axis_shapes=(2, 2), axis_names=('X', 'Y'),
+                                       axis_types=(shd.AxisType.Explicit, shd.AxisType.Explicit))
+
+# This tells JAX to use this mesh for all operations, so you can just specify the PartitionSpec P.
+jax.set_mesh(mesh)
+
+x = jax.device_put(np.arange(16).reshape(8, 2), P('X', 'Y'))
+
+@jax.jit
+def f(x):
+  print(jax.typeof(x))  # bfloat16[8@X,2@Y]
+  out = x * 2
+  print(jax.typeof(out))  # bfloat16[8@X,2@Y]
+  return out
+
+f(x)
+\end{lstlisting}
+
+As you can see, JAX propagated the sharding from input (\texttt{x}) to output (\texttt{x}) which are inspectable at trace-time via \texttt{jax.typeof}. For most operations these rules are simple and obvious because there's only one reasonable choice (e.g. elementwise ops retain the same sharding). But for some operations it's ambiguous how to shard the result in which case JAX throws a trace-time error and we ask the programmer to provide an \texttt{out\_sharding} argument explicitly (e.g. \texttt{jnp.einsum}, \texttt{jnp.reshape}, etc). Let's see another example where you have conflicts:
+
+\begin{lstlisting}[language=Python, basicstyle=\small\ttfamily, breaklines=true]
+# We create a matrix W and input activations In sharded across our devices.
+In = jnp.zeros((8, 2048), dtype=jnp.bfloat16, out_sharding=jax.P('X', 'Y'))
+W = jnp.zeros((2048, 8192), dtype=jnp.bfloat16, out_sharding=jax.P('Y', None))
+
+@jax.jit
+def matmul_square(In, W):
+  print(jax.typeof(In))  # bfloat16[8@X, 2048@Y]
+  print(jax.typeof(W))  # bfloat16[2048@Y, 8192]
+  return jnp.einsum('bd,df->bf', jnp.square(In), W)
+
+matmul_square(In, W)  # This will error
+\end{lstlisting}
+
+This code errors with \texttt{Contracting dimensions are sharded and it is ambiguous how the output should be sharded. Please specify the output sharding via the `out\_sharding` parameter. Got lhs\_contracting\_spec=('Y',) and rhs\_contracting\_spec=('Y',)}
+
+This is awesome because how the output of einsum should be sharded is ambiguous. The output sharding can be:
+\begin{itemize}
+\item \texttt{P('X', 'Y')} which will induce a reduce-scatter or
+\item \texttt{P('X', None)} which will induce an all-reduce
+\end{itemize}
+
+Unlike Auto mode, explicit mode errors out when it detects ambiguous communication and requires the users to resolve it. So here you can do:
+
+\begin{lstlisting}[language=Python, basicstyle=\small\ttfamily, breaklines=true]
+@jax.jit
+def matmul_square(In, W):
+  return jnp.einsum('bd,df->bf', jnp.square(In), W, out_sharding=P('X', 'Y'))
+
+out = matmul_square(In, W)
+print(jax.typeof(out))  # bfloat16[8@X,8192@Y]
+\end{lstlisting}
+
+Auto mode and Explicit mode can be composed via \texttt{jax.sharding.auto\_axes} and \texttt{jax.sharding.explicit\_axes} APIs. This is a great doc to read\footnote{See JAX explicit sharding notebook at: \texttt{docs.jax.dev/en/latest/} \texttt{notebooks/explicit-sharding.html}} for more information.

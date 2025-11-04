@@ -1,13 +1,16 @@
 #!/bin/bash
 
 # Build script for "How to Scale Your Model" LaTeX book
-# Usage: ./build.sh [command]
+# Usage: ./build.sh [flags] [command]
 #
 # Commands:
 #   all      - Build complete book (default)
 #   chapter  - Build specific chapter (usage: ./build.sh chapter 01)
 #   clean    - Remove build artifacts
 #   help     - Show this help message
+#
+# Flags:
+#   --skip-images  - Skip syncing images from source submodule
 
 set -e  # Exit on error
 
@@ -45,6 +48,9 @@ clean() {
     print_info "Clean complete."
 }
 
+# Global flag for skipping image sync
+SKIP_IMAGES=false
+
 # Function to initialize git submodule if needed
 init_submodule() {
     local SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -54,6 +60,48 @@ init_submodule() {
         print_info "Initializing git submodule..."
         cd "$SCRIPT_DIR" && git submodule update --init --recursive
     fi
+}
+
+# Function to sync images from source submodule
+sync_images() {
+    if [ "$SKIP_IMAGES" = true ]; then
+        print_info "Skipping image sync (--skip-images flag set)"
+        return 0
+    fi
+
+    print_info "Syncing images from source submodule..."
+
+    local SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    local SOURCE_IMG="$SCRIPT_DIR/scaling-book/assets/img"
+    local SOURCE_GPU="$SCRIPT_DIR/scaling-book/assets/gpu"
+    local DEST_IMG="$SCRIPT_DIR/$SOURCE_DIR/images"
+
+    # Check if source directories exist
+    if [ ! -d "$SOURCE_IMG" ]; then
+        print_warning "Source image directory not found: $SOURCE_IMG"
+        print_warning "Make sure the git submodule is initialized"
+        return 1
+    fi
+
+    # Create destination directories
+    mkdir -p "$DEST_IMG/gpu"
+
+    # Copy PNG files using rsync (only updates changed files)
+    rsync -au --exclude="*.gif" "$SOURCE_IMG/" "$DEST_IMG/" 2>/dev/null || true
+
+    # Copy GPU images
+    if [ -d "$SOURCE_GPU" ]; then
+        rsync -au "$SOURCE_GPU/" "$DEST_IMG/gpu/" 2>/dev/null || true
+    fi
+
+    # Copy specific GIF files that are kept as GIFs in LaTeX
+    for gif in all-gather continuous-batching pointwise-product; do
+        if [ -f "$SOURCE_IMG/${gif}.gif" ]; then
+            cp -p "$SOURCE_IMG/${gif}.gif" "$DEST_IMG/"
+        fi
+    done
+
+    print_info "Image sync complete"
 }
 
 # Function to build complete book
@@ -67,6 +115,9 @@ build_book() {
 
     # Initialize submodule if needed
     init_submodule
+
+    # Sync images from source submodule
+    sync_images
 
     # Create build directory if it doesn't exist
     mkdir -p "$ABS_BUILD_DIR"
@@ -163,7 +214,7 @@ show_help() {
     cat << EOF
 Build script for "How to Scale Your Model" LaTeX book
 
-Usage: ./build.sh [command]
+Usage: ./build.sh [flags] [command]
 
 Commands:
     all      - Build complete book with table of contents (default)
@@ -171,16 +222,36 @@ Commands:
     clean    - Remove all build artifacts
     help     - Show this help message
 
+Flags:
+    --skip-images  - Skip syncing images from source submodule (faster rebuilds)
+
 Examples:
-    ./build.sh              # Build complete book
-    ./build.sh all          # Build complete book
-    ./build.sh chapter 01   # Build chapter 01 only
-    ./build.sh clean        # Clean build files
+    ./build.sh                    # Build complete book
+    ./build.sh all                # Build complete book
+    ./build.sh --skip-images all  # Build without syncing images
+    ./build.sh chapter 01         # Build chapter 01 only
+    ./build.sh clean              # Clean build files
+
+Note: Images are automatically synced from the scaling-book submodule.
+Use --skip-images for faster rebuilds when images haven't changed.
 
 EOF
 }
 
 # Main script logic
+# Check for flags first
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --skip-images)
+            SKIP_IMAGES=true
+            shift
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
 case "${1:-all}" in
     all)
         build_book

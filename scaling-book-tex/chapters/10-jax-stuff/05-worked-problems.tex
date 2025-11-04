@@ -1,0 +1,42 @@
+\section{Worked Problems}
+
+Here are some random JAX-related problems. I'll add some more later. For all of these, you'll need some number of TPUs in a Colab. You can use a public Colab with TPUv2-8. From now on, we'll assume you have N devices available.
+
+\textbf{Problem 1:} Let \textbf{A} be an array of activations of shape float32[$S_X$, $D_Y$] with \texttt{X * Y = N}. Do the following:
+
+\begin{enumerate}
+\item Write a function in JAX that computes the average within each \texttt{(X, Y)} shard, i.e. it returns an array of size \texttt{[X, Y]} where \texttt{arr[i, j]} is the average over shard \texttt{(i, j)}. Do this with both \texttt{jax.jit} and \texttt{shard\_map}. Profile each and see how long they took. Was there any communication added? \emph{Hint: there shouldn't be, but sometimes XLA adds it anyway.}
+
+\item Write a function in JAX that returns \texttt{roll(x, shift, axis=0) - x} for some shift \textbf{within each shard X}. I'm not enough of a masochist to make you do this in \texttt{jax.jit}, so just do this with \texttt{shard\_map}.
+\end{enumerate}
+
+
+\textbf{Problem 2:} Here we'll make a basic ``mixture of experts'' model together. Let \textbf{W}: float32[$E_X$, D, $F_Y$] be a set of E ``expert'' matrices. Let \textbf{A}: float32[$S_X$, $D_Y$] (our activations) and let \textbf{B} be a set of ``routing assignments'' where \texttt{B[i]} is an integer in the range \texttt{[0, E)} telling us which matrix we want to process that activation. We want to write a function in JAX that returns \texttt{Out[i] = W[B[i]] @ A[i]}.
+
+\begin{enumerate}
+\item Let's start by ignoring sharding altogether. Make all of these tensors small enough so they fit in one device. Write a local implementation of this function. \emph{Make sure you don't materialize an array of shape \texttt{[S, D, F]}! Hint: try sorting the tokens into a new buffer of shape \texttt{[E, S, D]} with some attention to masking (why do we need the second dimension to have size S?).}
+
+\item If you just \texttt{jax.jit} the above method, something will happen. Profile this and see what communication it decided to do. How long does it take?
+
+\item One problem you'll notice with the above is that it likely gathers the full set of activations \textbf{A} locally, i.e. AllGather$_X$([$S_X$, $D_Y$]), Not only is this expensive communication-wise, it's also incredibly expensive memory-wise if we can't fit the full set of activations locally. Implement the above using \texttt{shard\_map} and explicit communication.
+
+\begin{enumerate}
+\item For a first pass, it might be easiest to use a \texttt{jax.lax.all\_gather} and reorder as in (a).
+
+\item For a second pass, try to avoid materializing any array of size \texttt{[E, S, D]}, i.e. try to perform the computation in a ragged fashion using a \texttt{jax.lax.all\_to\_all} inside a \texttt{jax.lax.while\_loop}. This way, you can avoid materializing the full activations and wasting compute on padding. How much faster is this than your original implementation?
+\end{enumerate}
+
+\item Most MoEs route to multiple (k) experts and then average the result. Refactor the above to implement this. Let \textbf{B}: int32[S, k] in this case for the k experts to route to.
+\end{enumerate}
+
+\textbf{Problem 3:} The collective matmul example above is actually super relevant for real LLMs. Let's tweak the example to do the full Transformer stack.
+
+\begin{enumerate}
+\item As an exercise, let's start by implementing an AllReduce collective matmul, i.e. A[$B_X$, $D_Y$] $*_D$ W[$D_Y$, F] $\rightarrow$ Out[$B_X$, F]. Note that the output isn't replicated. The naive algorithm is discussed above, basically just a local matmul followed by an AllReduce. Try to make a comms overlapped ``collective'' version of this operation. \emph{Hint: tile over the output dimension and feel free to use \texttt{jax.lax.psum} (aka AllReduce).} \emph{Note: due to the way XLA handles this, it may not actually be faster than the baseline.}
+
+\item The complement to the AllReduce collective matmul above is a ReduceScatter collective matmul, as in Tmp[$B_X$, $F_Y$] $*_F$ W2[$F_Y$, D] $\rightarrow$ Out[$B_X$, $D_Y$]. This occurs in the down-projection matrix in a Transformer. Implement a collective, overlapped version of this in JAX. Be careful about passing only the minimal amount of data you need. \emph{Hint: try permuting the result as you accumulate it.}
+
+\item Put these two together into an end-to-end Transformer block that performs In[$B_X$, $D_Y$] $*_D$ $W_{in}$[D, $F_Y$] $*_F$ $W_{out}$[$F_Y$, D] $\rightarrow$ Out[$B_X$, $D_Y$] with overlapped communication.\footnote{As before, we can't do $W_{in} \cdot W_{out}$ first because of a non-linearity we've omitted here.} How much faster is this than a \texttt{jax.jit} implementation?
+\end{enumerate}
+
+\textbf{Problem 4:} All of the collective matmuls implemented above are unidirectional: they only permute in one direction. Rewrite the collective AllReduce matmul and the collective ReduceScatter matmuls to use bidirectional communication. How much faster are these?

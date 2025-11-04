@@ -1,0 +1,13 @@
+\subsection{What about prefill?}
+
+We've mostly ignored prefill here because it's much simpler. Let's put a couple of concepts together and think about the end-to-end picture.
+
+\textbf{Question:} Assume we achieve a 40\% FLOPs utilization during prefill. How long will a prefill of length 8192 take on 16 TPU v5e chips?
+
+\vspace{1em}
+
+\textbf{Question:} Assume we have a median prefill length of 8192 tokens and a median decode length of 4096 tokens. Say we have a generate batch size of 32. On average how many sequences finish decoding per step? On average how many tokens are evicted from our KV cache each step?
+
+\vspace{1em}
+
+\textbf{Question:} Assume we do disaggregated serving with a median prefill length of 8192 and a median decode length of 512. Assume the prefill and generate latencies calculated above in bfloat16. What ratio of prefill:generate servers will you need to keep both fully saturated.

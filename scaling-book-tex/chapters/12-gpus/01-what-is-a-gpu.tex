@@ -1,0 +1,203 @@
+\section{What Is a GPU?}
+
+A modern ML GPU (e.g. H100, B200) is basically a bunch of compute cores that specialize in matrix multiplication (called \textbf{Streaming Multiprocessors} or \textbf{SMs}) connected to a stick of fast memory (called \textbf{HBM}). Here's a diagram:
+
+\begin{figure}[htb]
+\centering
+\includegraphics[width=\textwidth]{images/gpu/gpu-diagram.png}
+\caption{A diagram showing the abstract layout of an H100 or B200 GPU. An H100 has 132 SMs while a B200 has 148. We use the term `Warp Scheduler' somewhat broadly to describe a set of 32 CUDA SIMD cores \emph{and} the scheduler that dispatches work to them. Note how much this looks like a TPU!}
+\label{fig:gpu-diagram}
+\end{figure}
+
+Each SM, like a TPU's Tensor Core, has a dedicated matrix multiplication core (unfortunately also called a \textbf{Tensor Core}\footnote{The GPU Tensor Core is the matrix multiplication sub-unit of the SM, while the TPU TensorCore is the umbrella unit that contains the MXU, VPU, and other components.}), a vector arithmetic unit (called a \textbf{Warp Scheduler}\footnote{NVIDIA doesn't have a good name for this, so we use it only as the best of several bad options. The Warp Scheduler is primarily the unit that dispatches work to a set of CUDA cores, but we use it here to describe the control unit and the set of cores it controls.}), and a fast on-chip cache (called \textbf{SMEM}). Unlike a TPU, which has at most 2 independent ``Tensor Cores'', a modern GPU has more than 100 SMs (132 on an H100). Each of these SMs is much less powerful than a TPU Tensor Core but the system overall is more flexible. Each SM is more or less totally independent, so a GPU can do hundreds of separate tasks at once.\footnote{Although SMs are independent, they are often forced to coordinate for peak performance because they all share a capacity-limited L2 cache.}
+
+Let's take a more detailed view of an H100 SM:
+
+\begin{figure}[htb]
+\centering
+\includegraphics[width=0.7\textwidth]{images/gpu/blackwell-sm.png}
+\caption{A diagram of an H100 SM (source: \texttt{wccftech.com/nvidia-hopper-gh100-gpu-official-5nm-process-worlds-} \texttt{fastest-hpc-chip-80-billion-transistors-hbm3-memory/}) showing the 4 \emph{subpartitions}, each containing a Tensor Core, Warp Scheduler, Register File, and sets of CUDA Cores of different precisions. The `L1 Data Cache' near the bottom is the 256kB SMEM unit. A B200 looks similar, but adds a substantial amount of Tensor Memory (TMEM) for feeding the bulky Tensor Cores.}
+\label{fig:blackwell-sm}
+\end{figure}
+
+Each SM is broken up into 4 identical quadrants, which NVIDIA calls \textbf{SM subpartitions}, each containing a Tensor Core, 16k 32-bit registers, and a SIMD/SIMT vector arithmetic unit called a Warp Scheduler, whose lanes (ALUs) NVIDIA calls \textbf{CUDA Cores}. The core component of each partition is arguably the Tensor Core, which performs matrix multiplications and makes up the vast majority of its FLOPs/s, but it's not the only component worth noting.
+
+\begin{itemize}
+\item \textbf{CUDA Cores:} each subpartition contains a set of ALUs called CUDA Cores that do SIMD/SIMT vector arithmetic. Each ALU can generally do 1 arithmetic op each cycle, e.g. f32.add.\footnote{Newer GPUs support FMA (Fused-Multiply Add) instructions which technically do two FLOPs each cycle, a fact NVIDIA uses ruthelessly to double their reported specs.} Each subpartition contains 32 fp32 cores (and a smaller number of int32 and fp64 cores) that all execute the same instruction in each cycle. Like the TPU's VPU, CUDA cores are responsible for ReLUs, pointwise vector operations, and reductions (sums).\footnote{Historically, before the introduction of the Tensor Core, the CUDA cores were the main component of the GPU and were used for rendering, including ray-triangle intersections and shading. On today's gaming GPUs, they still do a bulk of the rendering work, while TensorCores are used for up-sampling (DLSS), which allows the GPU to render at a lower resolution (fewer pixels = less work) and upsample using ML.}
+
+\item \textbf{Tensor Core (TC):} each subpartition has its own Tensor Core, which is a dedicated matrix multiplication unit like a TPU MXU. The Tensor Core represents the vast majority of the GPUs FLOPs/s (e.g. on an H100, we have 990 bf16 TC TFLOP/s compared to just 66 TFLOPs/s from the CUDA cores).
+  \begin{itemize}
+  \item 990 bf16 TFLOPs/s with 132 SM running at 1.76GHz means each H100 TC can do $7.5\text{e}12 / 1.76\text{e}9 / 4 \sim 1024$ bf16 FLOPs/cycle, roughly an 8x8x8 matmul.\footnote{NVIDIA doesn't share many TC hardware details, so this is more a guess than definite fact -- certainly, it doesn't speak to how the TC is implemented. We know that a V100 can perform 256 FLOPs/TC/cycle. An A100 can do 512, H100 can do 1024, and while the B200 details aren't published, it seems likely it's about 2048 FLOPs/TC/cycle, since $2250\text{e}12 / (148 * 4 * 1.86\text{e}9)$ is about 2048. Some more details are confirmed at: \texttt{forums.developer.nvidia.com/t/how-to-calculate-the-tensor-core-} \texttt{fp16-performance-of-h100/244727}.}
+  \item Like TPUs, GPUs can do lower precision matmuls at higher throughput (e.g. H100 has 2x fp8 FLOPs/s vs. fp16). Low-precision training or serving can be significantly faster.
+  \item Each GPU generation since Volta has increased the TC size over the previous generation (see good article on this at: \texttt{semianalysis.com/2025/06/23/nvidia-tensor-core-} \texttt{evolution-from-volta-to-blackwell/}). With B200 the TC has gotten so large it can no longer fit its inputs in SMEM, so B200s introduce a new memory space called TMEM.\footnote{In Ampere, the Tensor Core could be fed from a single warp, while in Hopper it requires a full SM (warpgroup) and in Blackwell it's fed from 2 SMs. The matmuls have also become so large in Blackwell that the arguments (specifically, the accumulator) no longer fit into register memory/SMEM, so Blackwell adds TMEM to account for this.}
+  \end{itemize}
+\end{itemize}
+
+\textbf{CUDA cores are more flexible than a TPU's VPU:} GPU CUDA cores (since V100) use what is called a SIMT (\emph{Single Instruction Multiple Threads}) programming model, compared to the TPU's SIMD (\emph{Single Instruction Multiple Data}) model. Like ALUs in a TPU's VPU, CUDA cores within a subpartition must execute the same operation in each cycle (e.g. if one core is adding two floats, then every other CUDA core in the subpartition must also do so). Unlike the VPU, however, each CUDA core (or ``thread'' in the CUDA programming model) has its own instruction pointer and can be \emph{programmed} independently. When two threads in the same warp are instructed to perform different operations, you effectively do \emph{both} operations, masking out the cores that don't need to perform the divergent operation.
+
+\begin{figure}[htb]
+\centering
+\includegraphics[width=\textwidth]{images/gpu/warp-divergence.png}
+\caption{An example of warp divergence within a set of threads (source: \texttt{images.nvidia.com/} \texttt{content/volta-architecture/pdf/volta-architecture-whitepaper.pdf}). White spaces indicate stalls of at least some fraction of the physical CUDA cores.}
+\label{fig:warp-divergence}
+\end{figure}
+
+This enables flexible programming at the thread level, but at the cost of silently degrading performance if warps diverge too often. Threads can also be more flexible in what memory they can access; while the VPU can only operate on contiguous blocks of memory, CUDA cores can access individual floats in shared registers and maintain per-thread state.
+
+\textbf{CUDA core scheduling is also more flexible:} SMs run a bit like multi-threaded CPUs, in the sense that they can ``schedule'' many programs (\textbf{warps}) concurrently (up to 64 per SM) but each \emph{Warp Scheduler} only ever executes a single program in each clock cycle.\footnote{Warps scheduled on a given SM are called ``resident''.} The Warp Scheduler automatically switches between active warps to hide I/O operations like memory loads. TPUs are generally single threaded by comparison.
+
+\subsection{Memory}
+
+Beyond the compute units, GPUs have a hierarchy of memories, the largest being HBM (the main GPU memory), and then a series of smaller caches (L2, L1/SMEM, TMEM, register memory).
+
+\begin{itemize}
+\item \textbf{Registers:} Each subpartition has its own register file containing 16,384 32-bit words on H100/B200 ($4 \times 16384 \times 4 = 256\text{kiB}$ per SM) accessible by the CUDA cores.
+  \begin{itemize}
+  \item Each CUDA core can only access up to 256 registers at a time, so although we can schedule up to 64 ``resident warps'' per SM, you can only fit 8 ($256 \times 1024 / (4 \times 32 \times 256)$) at a time if each thread uses 256 registers.
+  \end{itemize}
+
+\item \textbf{SMEM (L1 Cache):} each SM has its own 256kB on-chip cache called SMEM, which can either be programmer controlled as ``shared memory'' or used by the hardware as an on-chip cache. SMEM is used for storing activations and inputs to TC matmuls.
+
+\item \textbf{L2 Cache:} all SMs share\footnote{Technically, the L2 cache is split in two, so half the SMs can access 25MB a piece on an H100. There is a link connecting the two halves, but at lower bandwidth.} a relatively large ~50MB L2 cache used to reduce main memory accesses.
+  \begin{itemize}
+  \item This is similar in size to a TPU's VMEM but it's \textbf{much} slower and isn't programmer controlled. This leads to a bit of ``spooky action at a distance'' where the programmer needs to modify memory access patterns to ensure the L2 cache is well used.\footnote{The fact that the L2 cache is shared across all SMs effectively forces the programmer to run the SMs in a fairly coordinated way anyway, despite the fact that, in principle, they are independent units.}
+  \item NVIDIA does not publish the L2 bandwidth for their chips, but it's been measured (see: \texttt{chipsandcheese.com/p/nvidias-h100-funny-l2-and-tons-of-bandwidth}) to be about 5.5TB/s. Thus is roughly 1.6x the HBM bandwidth but it's full-duplex, so the effective bidirectional bandwidth is closer to 3x. By comparison, a TPU's VMEM is 2x larger \emph{and} has much more bandwidth (around 40TB/s).
+  \end{itemize}
+
+\item \textbf{HBM:} the main GPU memory, used for storing model weights, gradients, activations, etc.
+  \begin{itemize}
+  \item The HBM size has increased a lot from 32GB in Volta to 192GB in Blackwell (B200).
+  \item The bandwidth from HBM to the CUDA Tensor Core is called HBM bandwidth or memory bandwidth, and is about 3.35TB/s on H100 and 9TB/s on B200.
+  \end{itemize}
+\end{itemize}
+
+\subsection{Summary of GPU specs}
+
+Here is a summary of GPU specs for recent models. The number of SMs, clock speed, and FLOPs differ somewhat between variants of a given GPU. Here are memory capacity numbers:
+
+\begin{table}[htb]
+\centering
+\scriptsize
+\begin{tabular}{lccccc}
+\toprule
+\textbf{GPU} & \textbf{Generation} & \textbf{Clock Speed} & \textbf{SMs/chip} & \textbf{SMEM/SM} & \textbf{L2/chip} \\
+\midrule
+V100 & Volta & 1.25/1.38GHz & 80 & 96kB & 6MB \\
+A100 & Ampere & 1.10/1.41GHz & 108 & 192kB & 40MB \\
+H100 & Hopper & 1.59/1.98GHz & 132 & 256kB & 50MB \\
+H200 & Hopper & 1.59/1.98GHz & 132 & 256kB & 50MB \\
+B200 & Blackwell & ? & 148 & 256kB & 126MB \\
+\bottomrule
+\end{tabular}
+\caption{GPU memory specifications across generations (part 1).}
+\label{tab:gpu-memory-specs-1}
+\end{table}
+
+\begin{table}[htb]
+\centering
+\footnotesize
+\begin{tabular}{lc}
+\toprule
+\textbf{GPU} & \textbf{HBM/chip} \\
+\midrule
+V100 & 32GB \\
+A100 & 80GB \\
+H100 & 80GB \\
+H200 & 141GB \\
+B200 & 192GB \\
+\bottomrule
+\end{tabular}
+\caption{GPU memory specifications across generations (part 2).}
+\label{tab:gpu-memory-specs-2}
+\end{table}
+
+All generations have 256kB of register memory per SM. Blackwell adds 256kB of TMEM per SM as well. Here are the FLOPs and bandwidth numbers for each chip:
+
+\begin{table}[htb]
+\centering
+\scriptsize
+\begin{tabular}{lcccc}
+\toprule
+\textbf{GPU} & \textbf{Gen} & \textbf{HBM BW} & \textbf{bf16/fp16 FLOPs/s} & \textbf{fp8/int8 FLOPs/s} \\
+\midrule
+V100 & Volta & 9.0e11 & --- & --- \\
+A100 & Ampere & 2.0e12 & 3.1e14 & 6.2e14 \\
+H100 & Hopper & 3.4e12 & 9.9e14 & 2.0e15 \\
+H200 & Hopper & 4.8e12 & 9.9e14 & 2.0e15 \\
+B200 & Blackwell & 8.0e12 & 2.3e15 & 4.5e15 \\
+\bottomrule
+\end{tabular}
+\caption{GPU FLOPs and bandwidth specifications. B200 also supports 9.0e15 fp4 FLOPs/s.}
+\label{tab:gpu-flops-bw}
+\end{table}
+
+We exclude B100 since it wasn't mass-produced.\footnote{While NVIDIA made a B100 generation, they were only briefly sold and produced, allegedly due to design flaws that prevented them from running close to their claimed specifications. They struggled to achieve peak FLOPs without throttling due to heat and power concerns.} Some specs depend slightly on the precise version of the GPU, since NVIDIA GPUs aren't as standard as TPUs.
+
+Here's a helpful cheat sheet comparing GPU and TPU components:
+
+\begin{table}[htb]
+\centering
+\small
+\begin{tabular}{lll}
+\toprule
+\textbf{GPU} & \textbf{TPU} & \textbf{What is it?} \\
+\midrule
+SM & Tensor Core & Core ``cell'' with other units \\
+Warp Scheduler & VPU & SIMD vector arithmetic unit \\
+CUDA Core & VPU ALU & SIMD ALU \\
+SMEM (L1) & VMEM & Fast on-chip cache memory \\
+Tensor Core & MXU & Matrix multiplication unit \\
+HBM (GMEM) & HBM & High BW high capacity memory \\
+\bottomrule
+\end{tabular}
+\caption{GPU vs TPU component mapping.}
+\label{tab:gpu-tpu-mapping}
+\end{table}
+
+\subsection{GPUs vs. TPUs at the chip level}
+
+GPUs started out rendering video games, but since deep learning took off in the 2010s, they've started acting more and more like dedicated matrix multiplication machines -- in other words, more like TPUs.\footnote{Before the deep learning boom, GPUs (``Graphics Processing Units'') did, well, graphics -- mostly for video games. Video games represent objects with millions of little triangles, and the game renders (or ``rasterizes'') these triangles into a 2D image that gets displayed on a screen 30-60 times a second (this frequency is called the framerate). Rasterization involves projecting these triangles into the coordinate frame of the camera and calculating which triangles overlap which pixels, billions of times a second. As you can imagine, this is very expensive, and it's just the beginning. You then have to color each pixel by combining the colors of possibly several semi-opaque triangles that intersect the ray. GPUs were designed to do these operations extremely fast, with an eye towards versatility; you need to run many different GPU workloads (called ``shaders'') at the same time, with no single operation dominating. As a result, consumer graphics-focused GPUs can do matrix multiplication, but it's not their primary function.} To an extent, this history explains why modern GPUs look the way they do. They weren't designed purely for LLMs or ML models but as general-purpose accelerators, and the hardware aims for level of ``generality'' that can be both a blessing and a curse. GPUs much more often ``just work'' when applied to new tasks and lean far less on a good compiler than TPUs do. But this also makes them much harder to reason about or get roofline performance out of, since so many compiler features can cause bottlenecks.
+
+\textbf{GPUs are more modular.} TPUs have 1-2 big Tensor Cores, while GPUs have hundreds of small SMs. Likewise, each Tensor Core has 4 big VPU with 1024 ALUs each, while GPUs have an H100 has 132 * 4 = 528 small independent SIMD units. Here is a 1:1 comparison of GPUs to TPU that highlights this point:
+
+\begin{table}[htb]
+\centering
+\small
+\begin{tabular}{llcc}
+\toprule
+\textbf{GPU} & \textbf{TPU} & \textbf{H100 \#} & \textbf{TPU v5p \#} \\
+\midrule
+SM & Tensor Core & 132 & 2 \\
+Warp Scheduler & VPU & 528 & 8 \\
+SMEM (L1) & VMEM & 32MB & 128MB \\
+Registers & VRegs & 32MB & 256kB \\
+Tensor Core & MXU & 528 & 8 \\
+\bottomrule
+\end{tabular}
+\caption{GPU vs TPU modularity comparison.}
+\label{tab:gpu-tpu-modularity}
+\end{table}
+
+This difference in modularity on the one hand makes TPUs much cheaper to build and simpler to understand, but it also puts more burden on the compiler to do the right thing. Because TPUs have a single thread of control and only support vectorized VPU-wide instructions, the compiler needs to manually pipeline all memory loads and MXU/VPU work to avoid stalls. A GPU programmer can just launch dozens of different kernels, each running on a totally independent SM. On the other hand, those kernels might get horrible performance because they are thrashing the L2 cache or failing to coalesce memory loads; because the hardware controls so much of the runtime, it becomes hard to reason about what's going on behind the scenes. As a result, TPUs can often get closer to peak roofline performance with less work.
+
+\textbf{Historically, individual GPUs are more powerful (and more expensive) than a comparable TPU:} A single H200 has close to 2x the FLOPs/s of a TPU v5p and 1.5x the HBM. At the same time, the sticker price on Google Cloud is around \$10/hour for an H200 compared to \$4/hour for a TPU v5p. TPUs generally rely more on networking multiple chips together than GPUs.
+
+\textbf{TPUs have a lot more fast cache memory.} TPUs also have a lot more VMEM than GPUs have SMEM (+TMEM), and this memory can be used for storing weights and activations in a way that lets them be loaded and used extremely fast. This can make them faster for LLM inference if you can consistently store or prefetch model weights into VMEM.
+
+\subsection{Quiz 1: GPU hardware}
+
+Here are some problems to work through that test some of the content above. Answers are provided, but it's probably a good idea to try to answer the questions before looking, pen and paper in hand.
+
+\textbf{Question 1 [CUDA cores]:} How many fp32 CUDA cores (ALUs) does an H100 have? B200? How does this compare to the number of independent ALUs in a TPU v5p?
+
+\textbf{Question 2 [Vector FLOPs calculation]:} A single H100 has 132 SMs and runs at a clock speed of 1.59GHz (up to 1.98GHz boost). Assume it can do one vector op per cycle per ALU. How many vector fp32 FLOPs can be done per second? With boost? How does this compare to matmul FLOPs?
+
+\textbf{Question 3 [GPU matmul intensity]:} What is the peak fp16 matmul intensity on an H100? A B200? What about fp8? \emph{By intensity we mean the ratio of matmul FLOPs/s to memory bandwidth.}
+
+\textbf{Question 4 [Matmul runtime]:} Using the answer to Question 3, how long would you expect an \texttt{fp16[64, 4096] * fp16[4096, 8192]} matmul to take on a single B200? How about \texttt{fp16[512, 4096] * fp16[4096, 8192]}?
+
+\textbf{Question 5 [L1 cache capacity]:} What is the total L1/SMEM capacity for an H100? What about register memory? How does this compare to TPU VMEM capacity?
+
+\textbf{Question 6 [Calculating B200 clock frequency]:} NVIDIA reports (see: \texttt{resources.nvidia.com/} \texttt{en-us-blackwell-architecture}) that a B200 can perform 80TFLOPs/s of vector fp32 compute. Given that each CUDA core can perform 2 FLOPs/cycle in a FMA (fused multiply add) op, estimate the peak clock cycle.
+
+\textbf{Question 7 [Estimating H100 add runtime]:} Using the figures above, calculate how long it ought to take to add two \texttt{fp32[N]} vectors together on a single H100. Calculate both $T_{\text{math}}$ and $T_{\text{comms}}$. What is the arithmetic intensity of this operation? If you can get access, try running this operation in PyTorch or JAX as well for \texttt{N = 1024} and \texttt{N=1024 * 1024 * 1024}. How does this compare?

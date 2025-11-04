@@ -12,7 +12,9 @@ The nice thing about FSDP and tensor parallelism is that they can be combined. B
 \end{figure}
 
 {\footnotesize
-\begin{tcolorbox}[algorithmbox, title=Algorithm: Combining FSDP and Tensor Parallelism]
+\begin{algorithmbox}
+
+\textbf{Algorithm: Combining FSDP and Tensor Parallelism}
 
 \textbf{Forward pass:} need to compute Loss[B]
 
@@ -43,7 +45,7 @@ The nice thing about FSDP and tensor parallelism is that they can be combined. B
     \item dIn[B\textsubscript{X}, D\textsubscript{Y}] = \textbf{ReduceScatter}\textsubscript{Y}(dIn[B\textsubscript{X}, D] \{U.Y\}) \textit{(on critical path)}
 \end{enumerate}
 
-\end{tcolorbox}
+\end{algorithmbox}
 }
 
 \textbf{What's the right combination of FSDP and TP?} A simple but key maxim is that FSDP moves weights and tensor parallelism moves activations. That means as our batch size shrinks (especially as we do more data parallelism), tensor parallelism becomes cheaper because our activations per-shard are smaller.
@@ -85,9 +87,9 @@ X_{opt} = \sqrt{\frac{B}{F} \frac{M_X}{M_Y} N}
 
 This is super useful! This tells us, for a given $B$, $F$, and $N$, what amount of FSDP is optimal. Let's get a sense of scale. Plugging in realistic values, namely $N = 64$ (corresponding to a~4x4x4 array of chips), $B=48,000$, $F=32768$, gives roughly $X\approx 13.9$. So we would choose $X$ to be~16 and $Y$ to be~4, close to our calculated optimum.
 
-\begin{tcolorbox}[takeawaybox]
+\begin{takeawaybox}
 In general, during training, the optimal amount of FSDP is $X_{opt} = \sqrt{\frac{B}{F} \frac{M_X}{M_Y} N}$.
-\end{tcolorbox}
+\end{takeawaybox}
 
 Now let's return to the question we've been asking of all our parallelism strategies: \textbf{under what conditions will we be compute-bound?} Since we can overlap FLOPs and comms, we are compute-bound~when
 
@@ -118,9 +120,9 @@ $$ \frac{B}{N} > \frac{\alpha^2}{M_X M_Y F}$$
 
 To get approximate numbers, again plug in $F=32,768$, $\alpha=2550$, and $M_X M_Y=2$ (as it must be for a~3D~mesh). This gives roughly $B/N > 99$. This roughly wins us a factor of eight compared to the purely data parallel (or FSDP) case, where assuming a~3D~mesh we calculate that $B/N$ must exceed about~850 to be compute bound.
 
-\begin{tcolorbox}[takeawaybox]
-Combining tensor parallelism with FSDP allows us to drop to a~$B/N$ of $2550^2 / 2F$. This lets us handle a batch of as little as~100 per chip, which is roughly a factor of eight smaller than we could achieve with just FSDP.
-\end{tcolorbox}
+\begin{takeawaybox}
+Combining tensor parallelism with FSDP allows us to drop to a per-device batch size of $2550^2 / 2F$. This lets us handle a batch of as little as~100 per device, which is roughly a factor of eight smaller than we could achieve with just FSDP.
+\end{takeawaybox}
 
 Below we plot the ratio of FLOPs to comms time for mixed FSDP~+~TP, comparing it both to only tensor parallelism (TP) and only data parallelism (FSDP), on a representative 4x4x4 chip array. While pure FSDP parallelism dominates for very large batch sizes, in the regime where batch size over number of chips is between roughly~100 and~850, a mixed FSDP~+~TP strategy is required in order to be compute-bound.
 
@@ -136,7 +138,7 @@ Here's another example of TPU v5p 16x16x16 showing the FLOPs and comms time as a
 \begin{figure}[htb]
     \centering
     \includegraphics[width=\textwidth]{images/math-comms-time.png}
-    \caption{Time taken for communication with different parallelism schemes. The black dashed line is the time taken by the matrix multiplication FLOPs, so any curve above this line is comms-bound. We note that all strategies become comms-bound below batch size 6e5, which is in line with our expected $4096 \times 2550^2 / (2 \times 8192 \times 4) = 4e5$.}
+    \caption{Time taken for communication with different parallelism schemes. The black dashed line is the time taken by the matrix multiplication FLOPs, so any curve above this line is comms-bound. We note that all strategies become bandwidth-bound below batch size 6e5, which is in line with our expected $4096 \times 2550^2 / (2 \times 8192 \times 4) = 4e5$.}
     \label{fig:math-comms-time}
 \end{figure}
 

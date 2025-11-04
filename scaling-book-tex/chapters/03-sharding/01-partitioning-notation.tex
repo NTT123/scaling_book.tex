@@ -93,34 +93,22 @@ So far we've avoided talking about code, but now is a good chance for a sneak pe
 \ImportTok{import}\NormalTok{ jax}
 \ImportTok{import}\NormalTok{ jax.numpy }\ImportTok{as}\NormalTok{ jnp}
 
-\CommentTok{\# Create mesh: TPU v2{-}8 in 4x2 grid}
+\CommentTok{\# Create our mesh! We\textquotesingle{}re running on a TPU v2{-}8 4x2 slice with names \textquotesingle{}X\textquotesingle{} and \textquotesingle{}Y\textquotesingle{}.}
 \ControlFlowTok{assert} \BuiltInTok{len}\NormalTok{(jax.devices()) }\OperatorTok{==} \DecValTok{8}
-\NormalTok{mesh }\OperatorTok{=}\NormalTok{ jax.make\_mesh(}
-\NormalTok{    axis\_shapes}\OperatorTok{=}\NormalTok{(}\DecValTok{4}\NormalTok{, }\DecValTok{2}\NormalTok{),}
-\NormalTok{    axis\_names}\OperatorTok{=}\NormalTok{(}\StringTok{\textquotesingle{}X\textquotesingle{}}\NormalTok{, }\StringTok{\textquotesingle{}Y\textquotesingle{}}\NormalTok{))}
+\NormalTok{mesh }\OperatorTok{=}\NormalTok{ jax.make\_mesh(axis\_shapes}\OperatorTok{=}\NormalTok{(}\DecValTok{4}\NormalTok{, }\DecValTok{2}\NormalTok{), axis\_names}\OperatorTok{=}\NormalTok{(}\StringTok{\textquotesingle{}X\textquotesingle{}}\NormalTok{, }\StringTok{\textquotesingle{}Y\textquotesingle{}}\NormalTok{))}
 
-\CommentTok{\# Helper to define sharding}
+\CommentTok{\# A little utility function to help define our sharding. A PartitionSpec is our}
+\CommentTok{\# sharding (a mapping from axes to names).}
 \KeywordTok{def} \FunctionTok{P}\NormalTok{(}\OperatorTok{*}\NormalTok{args):}
-  \ControlFlowTok{return}\NormalTok{ jax.NamedSharding(}
-\NormalTok{      mesh,}
-\NormalTok{      jax.sharding.PartitionSpec(}\OperatorTok{*}\NormalTok{args))}
+  \ControlFlowTok{return}\NormalTok{ jax.NamedSharding(mesh, jax.sharding.PartitionSpec(}\OperatorTok{*}\NormalTok{args))}
 
-\CommentTok{\# Shard A over both dims, B over output}
-\NormalTok{A }\OperatorTok{=}\NormalTok{ jnp.zeros(}
-\NormalTok{    (}\DecValTok{8}\NormalTok{, }\DecValTok{2048}\NormalTok{),}
-\NormalTok{    dtype}\OperatorTok{=}\NormalTok{jnp.bfloat16,}
-\NormalTok{    device}\OperatorTok{=}\FunctionTok{P}\NormalTok{(}\StringTok{\textquotesingle{}X\textquotesingle{}}\NormalTok{, }\StringTok{\textquotesingle{}Y\textquotesingle{}}\NormalTok{))}
+\CommentTok{\# We shard both A and B over the non{-}contracting dimension and A over the contracting dim.}
+\NormalTok{A }\OperatorTok{=}\NormalTok{ jnp.zeros((}\DecValTok{8}\NormalTok{, }\DecValTok{2048}\NormalTok{), dtype}\OperatorTok{=}\NormalTok{jnp.bfloat16, device}\OperatorTok{=}\FunctionTok{P}\NormalTok{(}\StringTok{\textquotesingle{}X\textquotesingle{}}\NormalTok{, }\StringTok{\textquotesingle{}Y\textquotesingle{}}\NormalTok{))}
+\NormalTok{B }\OperatorTok{=}\NormalTok{ jnp.zeros((}\DecValTok{2048}\NormalTok{, }\DecValTok{8192}\NormalTok{), dtype}\OperatorTok{=}\NormalTok{jnp.bfloat16, device}\OperatorTok{=}\FunctionTok{P}\NormalTok{(}\VariableTok{None}\NormalTok{, }\StringTok{\textquotesingle{}Y\textquotesingle{}}\NormalTok{))}
 
-\NormalTok{B }\OperatorTok{=}\NormalTok{ jnp.zeros(}
-\NormalTok{    (}\DecValTok{2048}\NormalTok{, }\DecValTok{8192}\NormalTok{),}
-\NormalTok{    dtype}\OperatorTok{=}\NormalTok{jnp.bfloat16,}
-\NormalTok{    device}\OperatorTok{=}\FunctionTok{P}\NormalTok{(}\VariableTok{None}\NormalTok{, }\StringTok{\textquotesingle{}Y\textquotesingle{}}\NormalTok{))}
-
-\CommentTok{\# Matmul on sharded arrays}
-\NormalTok{y }\OperatorTok{=}\NormalTok{ jax.jit(}
-    \KeywordTok{lambda}\NormalTok{ A, B: jnp.einsum(}
-\NormalTok{        }\StringTok{\textquotesingle{}BD,DF{-}\textgreater{}BF\textquotesingle{}}\NormalTok{, A, B),}
-\NormalTok{    out\_shardings}\OperatorTok{=}\FunctionTok{P}\NormalTok{(}\StringTok{\textquotesingle{}X\textquotesingle{}}\NormalTok{, }\StringTok{\textquotesingle{}Y\textquotesingle{}}\NormalTok{))(A, B)}
+\CommentTok{\# We can perform a matmul on these sharded arrays! out\_shardings tells us how we want}
+\CommentTok{\# the output to be sharded. JAX/XLA handles the rest of the sharding for us.}
+\NormalTok{y }\OperatorTok{=}\NormalTok{ jax.jit(}\KeywordTok{lambda}\NormalTok{ A, B: jnp.einsum(}\StringTok{\textquotesingle{}BD,DF{-}\textgreater{}BF\textquotesingle{}}\NormalTok{, A, B), out\_shardings}\OperatorTok{=}\FunctionTok{P}\NormalTok{(}\StringTok{\textquotesingle{}X\textquotesingle{}}\NormalTok{, }\StringTok{\textquotesingle{}Y\textquotesingle{}}\NormalTok{))(A, B)}
 \end{Highlighting}
 \end{Shaded}
 

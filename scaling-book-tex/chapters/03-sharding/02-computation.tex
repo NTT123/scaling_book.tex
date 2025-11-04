@@ -16,8 +16,8 @@ The rest of this section will deal with how to multiply sharded matrices. To a f
 
 To understand this, it can be helpful to recall the concept of a ``block matrix'', or a nested matrix of matrices:
 
+{\small
 \begin{equation}
-\small
 \begin{pmatrix}
 a_{00} & a_{01} & a_{02} & a_{03} \\
 a_{10} & a_{11} & a_{12} & a_{13} \\
@@ -53,11 +53,12 @@ a_{32} & a_{33}
 \mathbf{A_{10}} & \mathbf{A_{11}}
 \end{pmatrix}
 \end{equation}
+}
 
 Matrix multiplication has the nice property that when the matrix multiplicands are written in terms of blocks, the product can be written in terms of block matmuls following the standard rule:
 
+{\small
 \begin{align}
-\small
 \begin{pmatrix}
 A_{00} & A_{01} \\
 A_{10} & A_{11}
@@ -73,6 +74,7 @@ A_{00}B_{00} + A_{01}B_{10} & A_{00}B_{01} + A_{01}B_{11} \\
 A_{10}B_{00} + A_{11}B_{10} & A_{10}B_{01} + A_{11}B_{11}
 \end{pmatrix}
 \end{align}
+}
 
 What this means is that implementing distributed matrix multiplications reduces down to moving these sharded blocks over the network, performing \emph{local} matrix multiplications on the blocks, and summing their results. \textbf{The question then is what communication to add, and how expensive it is.}
 

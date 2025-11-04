@@ -68,9 +68,13 @@ T_\text{comms} &= \frac{\text{Communication Bytes}}{\text{Bandwidth Bytes/s}} = 
 
 A TPU or GPU can overlap these by loading as it does the compute, so to be compute-bound, we need $T_\text{math} \geq T_\text{comms}$~, or:
 
-$$\frac{2BDF}{2BD + 2DF + 2BF} \geq \frac{\text{Accelerator FLOPs/s}}{\text{Bandwidth Bytes/s}} \underset{\text{TPU v5e}}{=} \frac{1.97E+14}{8.20E+11} = 240$$
+{\small
+\begin{equation*}
+\frac{2BDF}{2BD + 2DF + 2BF} \geq \frac{\text{Accelerator FLOPs/s}}{\text{Bandwidth Bytes/s}} \underset{\text{TPU v5e}}{=} \frac{1.97E+14}{8.20E+11} = 240
+\end{equation*}
+}
 
-where the RHS is the arithmetic intensity of our hardware. Now let's assume $D$ and $F$ are very large compared to $B$ (usually our batches are at most 500 and $D$ and $F > 10k$), we can simplify the denominator by using the fact that $\small{2BD + 2DF + 2BF \approxeq 2DF}$ which gives us
+where the RHS is the arithmetic intensity of our hardware. Now let's assume $D$ and $F$ are very large compared to $B$ (usually our batches are at most 500 and $D$ and $F > 10k$), we can simplify the denominator by using the fact that $2BD + 2DF + 2BF \approxeq 2DF$ which gives us
 
 \begin{align*}
 \frac{2BDF}{2BD + 2DF + 2BF} &\approxeq \frac{2BDF}{2DF} \geq \frac{\text{Accelerator FLOPs/s}}{\text{Bandwidth Bytes/s}} \\
@@ -138,25 +142,28 @@ This also means you will get diminishing returns on throughput from increasing b
 
 From this math, we can get pretty good bounds on the step time we should aim for when optimizing. \textbf{(Note: if there is one thing we want to the reader to take away from this entire chapter, it's the following).} For small batch sizes during generation (which is common), we can lower-bound our per-step latency by assuming we're memory bandwidth bound in both the attention and MLP blocks:
 
+{\footnotesize
 \begin{equation*}
-\small
 \text{Theoretical Min Step Time} = \frac{\text{Batch Size} \times \text{KV Cache Size} + \text{Parameter Size}}{\text{Total Memory Bandwidth}}
 \end{equation*}
+}
 
 Similarly, for throughput:
 
+{\footnotesize
 \begin{equation*}
-\small
 \text{Theoretical Max Tokens/s} = \frac{\text{Batch Size} \times \text{Total Memory Bandwidth}}{\text{Batch Size} \times \text{KV Cache Size} + \text{Parameter Size}}
 \end{equation*}
+}
 
 Eventually, as our batch size grows, FLOPs begin to dominate parameter loading, so in practice we have the more general equation:
 
+{\footnotesize
 \begin{align*}
-\small
-&\text{\small Theoretical Step Time (General)} = \underbrace{\frac{\text{\small Batch Size} \times \text{KV Cache Size}}{\text{Total Memory Bandwidth}}}_{\text{\small Attention (always bandwidth-bound)}} \\
-& + \underbrace{\max\left(\frac{2 \times \text{\tiny Batch Size} \times \text{\tiny Parameter Count}}{\text{\tiny Total FLOPs/s}}, \frac{\text{\tiny Parameter Size}}{\text{\tiny Total Memory Bandwidth}}\right)}_{\text{\tiny MLP (can be compute-bound)}}
+&\text{Theoretical Step Time (General)} = \underbrace{\frac{\text{Batch Size} \times \text{KV Cache Size}}{\text{Total Memory Bandwidth}}}_{\text{Attention (always bandwidth-bound)}} \\
+& + \underbrace{\max\left(\frac{2 \times \text{Batch Size} \times \text{Parameter Count}}{\text{Total FLOPs/s}}, \frac{\text{Parameter Size}}{\text{Total Memory Bandwidth}}\right)}_{\text{MLP (can be compute-bound)}}
 \end{align*}
+}
 
 where the attention component (left) is never compute-bound, and thus doesn't need a FLOPs roofline. These are fairly useful for back-of-the-envelope calculations, e.g.
 

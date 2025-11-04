@@ -17,13 +17,6 @@ This repository contains the LaTeX source files for converting the scaling book 
 - `scaling-book/` - Git submodule containing original markdown source and images
 - `build/` - Build artifacts (generated, not tracked)
 
-## Requirements
-
-- XeLaTeX (from TeX Live or MacTeX)
-- BibTeX (included with TeX distributions)
-- Git (for submodule management)
-- rsync (standard on Unix systems)
-
 ## Compilation
 
 ### Quick Start
@@ -50,9 +43,6 @@ This will automatically:
 
 # Build without syncing images (faster rebuilds)
 ./build.sh --skip-images
-
-# Build specific chapter only
-./build.sh chapter 01
 
 # Clean build artifacts
 ./build.sh clean

@@ -1,0 +1,98 @@
+\subsection{Pipelining}
+
+You'll probably notice we've avoided talking about pipelining at all in the previous sections. Pipelining is a dominant strategy for GPU parallelism that is somewhat less essential on TPUs. Briefly, pipelined training involves splitting the layers of a model across multiple devices and passing the activations between pipeline stages during the forward and backward pass. The algorithm is something like:
+
+\begin{enumerate}
+    \item Initialize your data on TPU~0 with your weights sharded across the layer dimension ($W_\text{in}[L_Z, D_X, F_Y]$ for pipelining with FSDP and tensor parallelism).
+    \item Perform the first layer on TPU~0, then copy the resulting activations to TPU~1, and repeat until you get to the last TPU.
+    \item Compute the loss function and its derivative $\partial L / \partial x_L$.
+    \item For the last pipeline stage, compute the derivatives $\partial L / \partial W_L$ and $\partial L / \partial x_{L-1}$, then copy $\partial L / \partial x_{L-1}$ to the previous pipeline stage and repeat until you reach TPU~0.
+\end{enumerate}
+
+Here is some (working) Python pseudo-code. This pseudocode should run on a Cloud TPU VM. While it's not very efficient or realistic, it gives you a sense how data is being propagated across devices.
+
+\begin{Shaded}
+\begin{Highlighting}[]
+\NormalTok{batch\_size }\OperatorTok{=} \DecValTok{32}
+\NormalTok{d\_model }\OperatorTok{=} \DecValTok{128}
+\NormalTok{d\_ff }\OperatorTok{=} \DecValTok{4} \OperatorTok{*}\NormalTok{ d\_model}
+
+\NormalTok{num\_layers }\OperatorTok{=} \BuiltInTok{len}\NormalTok{(jax.devices())}
+
+\NormalTok{key }\OperatorTok{=}\NormalTok{ jax.random.PRNGKey(}\DecValTok{0}\NormalTok{)}
+
+\CommentTok{\# Pretend each layer is just a single matmul.}
+\NormalTok{x }\OperatorTok{=}\NormalTok{ jax.random.normal(key, (batch\_size, d\_model))}
+\NormalTok{weights }\OperatorTok{=}\NormalTok{ jax.random.normal(key, (num\_layers, d\_model, d\_model))}
+
+\KeywordTok{def} \FunctionTok{layer\_fn}\NormalTok{(x, weight):}
+  \ControlFlowTok{return}\NormalTok{ x }\OperatorTok{@}\NormalTok{ weight}
+
+\CommentTok{\# Assume we have num\_layers == num\_pipeline\_stages}
+\NormalTok{intermediates }\OperatorTok{=}\NormalTok{ [x]}
+\ControlFlowTok{for}\NormalTok{ i }\KeywordTok{in} \BuiltInTok{range}\NormalTok{(num\_layers):}
+\NormalTok{  x }\OperatorTok{=} \FunctionTok{layer\_fn}\NormalTok{(x, weights[i])}
+\NormalTok{  intermediates.append(x)}
+
+  \ControlFlowTok{if}\NormalTok{ i }\OperatorTok{!=}\NormalTok{ num\_layers }\OperatorTok{{-}} \DecValTok{1}\NormalTok{:}
+\NormalTok{    x }\OperatorTok{=}\NormalTok{ jax.device\_put(x, jax.devices()[i}\OperatorTok{+}\DecValTok{1}\NormalTok{])}
+
+\KeywordTok{def} \FunctionTok{loss\_fn}\NormalTok{(batch):}
+  \ControlFlowTok{return}\NormalTok{ jnp.mean(batch }\OperatorTok{**} \DecValTok{2}\NormalTok{)  }\CommentTok{\# make up some fake loss function}
+
+\NormalTok{loss, dx }\OperatorTok{=}\NormalTok{ jax.value\_and\_grad(loss\_fn)(x)}
+
+\ControlFlowTok{for}\NormalTok{ i }\KeywordTok{in} \BuiltInTok{range}\NormalTok{(}\DecValTok{0}\NormalTok{, num\_layers, }\OperatorTok{{-}}\DecValTok{1}\NormalTok{):}
+\NormalTok{  \_, f\_vjp }\OperatorTok{=}\NormalTok{ jax.vjp(layer\_fn, intermediates[i }\OperatorTok{+} \DecValTok{1}\NormalTok{], weights[i])}
+\NormalTok{  dx, dw }\OperatorTok{=}\NormalTok{ f\_vjp(dx)  }\CommentTok{\# compute the jvp dx @ J(L)(x[i], W[i])}
+\NormalTok{  weights[i] }\OperatorTok{=}\NormalTok{ weights[i] }\OperatorTok{{-}} \FloatTok{0.01} \OperatorTok{*}\NormalTok{ dw  }\CommentTok{\# update our weights}
+
+  \ControlFlowTok{if}\NormalTok{ i }\OperatorTok{!=} \DecValTok{0}\NormalTok{:}
+\NormalTok{    dx }\OperatorTok{=}\NormalTok{ jax.device\_put(dx, jax.devices()[i}\OperatorTok{{-}}\DecValTok{1}\NormalTok{])}
+\end{Highlighting}
+\end{Shaded}
+
+\textbf{Why is this a good idea?} Pipelining is great for many reasons: it has a low communication cost between pipeline stages, meaning you can train very large models even with low bandwidth interconnects. This is often very useful on GPUs since they are not densely connected by ICI in the way TPUs are.
+
+\textbf{Why is this difficult/annoying?} You might have noticed in the pseudocode above that TPU~0 is almost always idle! It's only doing work on the very first and last step of the pipeline. The period of idleness is called a pipeline bubble and is very annoying to deal with. Typically we try to mitigate this first with microbatching, which sends multiple small batches through the pipeline, keeping TPU~0 utilized for at least a larger fraction of the total step time.
+
+A second approach is to carefully overlap the forward matmul $W_i @ x_i$, the backward $dx$ matmul $W_i @ \partial L / \partial x_{i+1}$, and the $dW$ matmul $\partial L / \partial x_{i+1} @ x_i$. Since each of these requires some FLOPs, we can overlap them to fully hide the bubble. Here's a plot from the recent DeepSeek v3~paper~\cite{DeepSeek3} showing their ``bubble-free'' pipeline schedule:
+
+\begin{figure}[htb]
+    \centering
+    \includegraphics[width=\textwidth]{images/deepseek-pipeline.png}
+    \caption{The DeepSeek v3 pipeline schedule (from their recent paper). Orange is the forward matmul, green is the dL/dx matmul, and blue is the dL/dW matmul. By prioritizing the backwards dL/dx multiplications, we can avoid ``stranding'' FLOPs.}
+    \label{fig:deepseek-pipeline}
+\end{figure}
+
+Because it is less critical for TPUs (which have larger interconnected pods), we won't delve into this as deeply, but it's a good exercise to understand the key pipelining bottlenecks.
+
+\subsection{Scaling Across Pods}
+
+The largest possible TPU slice is a TPU v5p SuperPod with 8960 chips (and 2240 hosts). When we want to scale beyond this size, we need to cross the Data-Center Networking (DCN) boundary. Each TPU host comes equipped with one or several NICs (Network Interface Cards) that connect the host to other TPU v5p pods over Ethernet. As noted in the TPU Section, each host has about 200Gbps (25GB/s) of full-duplex DCN bandwidth, which is about 6.25GB/s full-duplex (egress) bandwidth per TPU.
+
+Typically, when scaling beyond a single pod, we do some form of model parallelism or FSDP within the ICI domain, and then pure data parallelism across multiple pods. Let $N$ be the number of TPUs we want to scale to and $M$ be the number of TPUs per ICI-connected slice. To do an AllReduce over DCN, we can do a ring-reduction over the set of pods, giving us (in the backward pass):
+
+$$T_\text{math} = \frac{2 \cdot 2 \cdot 2 \cdot BDF}{N \cdot C}$$
+
+$$T_\text{comms} = \frac{2 \cdot 2 \cdot 2 \cdot DF}{M \cdot W_\text{dcn}}$$
+
+The comms bandwidth scales with $M$, since unlike ICI the total bandwidth grows as we grow our ICI domain and acquire more NICs. Simplifying, we find that $T_\text{math} > T_\text{comms}$ when
+
+$$\frac{B}{\text{slice}} > \frac{C}{W_\text{dcn}}$$
+
+For TPU v5p, the $\frac{C}{W_\text{dcn}}$ is about \texttt{4.46e14 / 6.25e9 = 71,360}. This tells us that to efficiently scale over DCN, there is a minimum batch size per ICI domain needed to egress each node.
+
+\textbf{How much of a problem is this?} To take a specific example, say we want to train LLaMA-3 70B on TPU v5p with a BS of 2M tokens. LLaMA-3 70B has $F\approx 30,000$. From the above sections, we know the following:
+
+\begin{itemize}
+    \item We can do Tensor Parallelism up to above $Y = M_Y \cdot F / 2550 \approxeq 11 \cdot M_Y$.
+    \item We can do FSDP so long as $B / N > 2550 / M_X$. That means if we want to train with BS=2M and 3~axes of data parallelism, we'd at most be able to use $\approx 2400$ chips, roughly a quarter of a TPU v5p pod.
+    \item When we combine FSDP~+~Tensor Parallelism, become comms-bound when we have $B / N < 2550^2 / 2 * 30,000 = 108$, so this lets us scale to roughly 18k chips! However, the maximum size of a TPU v5p pod is 8k chips, so beyond that we have to use DCN.
+\end{itemize}
+
+The TLDR is that we have a nice recipe for training with BS=1M, using roughly X~(FSDP)~=~1024 and Y~(TP)~=~8, but with BS=2M we need to use DCN. As noted above, we have a DCN arithmetic intensity of 71,360, so we just need to make sure our batch size per ICI domain is greater than this. This is trivial for us, since with 2~pods we'd have a per-pod BS of 1M, and a per GPU batch size of 111, which is great (maybe cutting it a bit close, but theoretially sound).
+
+\begin{tcolorbox}[takeawaybox]
+Scaling across multiple TPU pods is fairly straightforward using pure data parallelism so long as our per-pod batch size is at least 71k tokens.
+\end{tcolorbox}

@@ -1,0 +1,105 @@
+\section{Designing an Effective Inference Engine}
+
+So far we've looked at how to optimize and shard the individual prefill and generate operations efficiently in isolation. To actually use them effectively, we need to design an inference engine which can feed these two operations at a point of our choosing on the latency/throughput Pareto frontier.
+
+The simplest method is simply to run a batch of prefill, then a batch of generations:
+
+\begin{figure}[htb]
+\centering
+\includegraphics[width=\textwidth]{images/batched-prefill.png}
+\caption{In the simplest setup, requests are aggregated, and the server alternates between running a batch of prefills and calling the generate function until completion for all sequences.}
+\end{figure}
+
+This is easy to implement and is the first inference setup in most codebases, but it has multiple drawbacks:
+
+\begin{enumerate}
+\item \textbf{Latency is terrible.} We couple the prefill and generate batch size. Time to first token (TTFT) is terrible at big prefill batch sizes---you need to finish all prefills before any users can see any tokens. Generate throughput is terrible at small batch sizes.
+\item \textbf{We block shorter generations on longer ones.} Many sequences will finish before others, leaving empty batch slots during generation, hurting generate throughput further. The problem exacerbates as batch size and generation length increases.
+\item \textbf{Prefills are padded.} Prefills are padded to the longest sequence and we waste a lot of compute. There are solutions for this, but historically XLA made it quite difficult to skip these FLOPs. Again this becomes worse the bigger the batch size and prefill sequence length.
+\item \textbf{We're forced to share a sharding between prefill and generation.} Both prefill and generate live on the same slice, which means we use the same topology and shardings (unless you keep two copies of the weights) for both and is generally unhelpful for performance e.g. generate wants a lot more model sharding.
+\end{enumerate}
+
+Therefore this method is only recommended for edge applications (which usually only cares about serving a single user and using hardware with less FLOPs/byte) and rapid iteration early in the lifecycle of a Transformer codebase (due to its simplicity).
+
+A slightly better approach involves performing prefill at batch size 1 (where it is compute-bound but has reasonable latency) but batch multiple requests together during generation:
+
+\begin{figure}[htb]
+\centering
+\includegraphics[width=\textwidth]{images/interleaving.png}
+\end{figure}
+
+This will avoid wasted TTFT from batched prefill while keeping generation throughput high. We call this an \textbf{interleaved} configuration, since we ``interleave'' prefill and generation steps. This is very powerful for bulk generation applications like evaluations where throughput is the main goal. The orchestrator can be configured to prioritise prefill the moment any generation slots open up, ensuring high utilisation even for very large generation batch sizes. We can also avoid padding our prefill to the maximum length, since it isn't batched with another request.
+
+The main disadvantage is that when the server is performing a prefill, the generation of all other requests pauses since all the compute resources will be consumed by the prefill. User A whose response is busy decoding will be blocked by user B whose prefill is occurring. This means even though TTFT has improved, the token generation will be jittery and slow on average, which is not a good user experience for many applications---other user's prefills are on the critical path of the overall latency of a request.
+
+To get around this, we separate decode and prefill. While Transformer inference can be done on one server, it is often better from a latency standpoint to execute the two different tasks on two sets of TPUs/GPUs. Prefill servers generate KV caches that get sent across the network to the generate servers, which batch multiple caches together and generate tokens for each of them. We call this \textbf{``disaggregated''} serving.
+
+\begin{figure}[htb]
+\centering
+\includegraphics[width=\textwidth]{images/disaggregation.png}
+\end{figure}
+
+This provides a few advantages:
+
+\begin{enumerate}
+\item \textbf{Low latency at scale}: A user's request never blocks on another user's, except if there is insufficient prefill capacity. The request should be immediately prefilled, then sent to the generation server, then immediately slotted into the generation buffer. If we expect many concurrent requests to come in, we can scale the number of prefill servers independently from the number of generate servers so users are not left in the prefill queue for an extended period of time.
+
+\item \textbf{Specialization:} Quite often, the latency-optimal parameter sharding strategy/hardware topology for prefill and generate is quite different (for instance, more model parallelism is useful for generate but not prefill). Constraining the two operations to use the same sharding hurts the performance of both, and having two sets of weights uses memory. Also, by moving prefill onto its own server, it doesn't need to hold any KV caches except the one it's currently processing. That means we have a lot more memory free for history caching (see the next section) or optimizing prefill latency.
+\end{enumerate}
+
+One downside is that the KV cache now needs to be shifted across the network. This is typically acceptable but again provides a motivation for reducing KV cache size.
+
+\begin{takeawaybox}
+For latency-sensitive, high-throughput serving, we typically have to separate prefill and generation into separate servers, with prefill operating at batch 1 and generation batching many concurrent requests together.
+\end{takeawaybox}
+
+\subsection{Continuous batching}
+
+Problem (2) above motivates the concept of \textbf{continuous batching}. We optimize and compile:
+
+\begin{itemize}
+\item A number of prefill functions with variable context lengths and inserts it into some KV buffer, some maximum batch size and context length/number of pages.
+\item A generate function which takes in the KV cache, and performs the generation step for all currently active requests.
+\end{itemize}
+
+We then combine these functions with an orchestrator which queues the incoming requests, calls prefill and generate depending on the available generate slots, handles history caching (see next section) and streams the tokens out.
+
+% Note: continuous-batching.gif is an animated GIF that cannot be included in PDF
+% (XeLaTeX does not support GIF format)
+
+\subsection{Prefix caching}
+
+Since prefill is expensive and compute-bound (giving us less headroom), one of the best ways to reduce its cost is to do less of it. Because LLMs are autoregressive, the queries [``I'', ``like'', ``dogs''] and [``I'', ``like'', ``cats''] produce KV caches that are identical in the first two tokens. What this means is that, in principle, if we compute the ``I like dogs'' cache first and then the ``I like cats'' cache, we only need to do 1 / 3 of the compute. We can save most of the work by reusing the cache. This is particularly powerful in a few specific cases:
+
+\begin{enumerate}
+\item \textbf{Chatbots}: most chatbot conversations involve a back-and-forth dialog that strictly appends to itself. This means if we can save the KV caches from each dialog turn, we can skip computation for all but the newest tokens.
+\item \textbf{Few-shot prompting}: if we have any kind of few-shot prompt, this can be saved and reused for free. System instructions often have this form as well.
+\end{enumerate}
+
+The only reason this is hard to do is memory constraints. As we've seen, KV caches are big (often many GB), and for caching to be useful we need to keep them around until a follow-up query arrives. Typically, any unused HBM on the prefill servers can be used for a local caching system. Furthermore, accelerators usually have a lot of memory on their CPU hosts (e.g. a 8xTPUv5e server has 128GiB of HBM, but around 450GiB of Host DRAM). This memory is much slower than HBM---too slow to do generation steps usually---but is fast enough for a cache read. In practice:
+
+\begin{itemize}
+\item Because the KV cache is local to the set of TPUs that handled the initial request, we need some form of affinity routing to ensure follow-up queries arrive at the same replica. This can cause issues with load balancing.
+\item A smaller KV cache is helpful (again)---it enables us to save more KV caches in the same amount of space, and reduce read times.
+\item The KV cache and their lookups can be stored quite naturally in a tree or trie. Evictions can happen on an LRU basis.
+\end{itemize}
+
+\begin{figure}[htb]
+\centering
+\includegraphics[width=\textwidth]{images/prefix-caching-trie.png}
+\caption{KV prefix cache implemented as an LRU trie. We can avoid duplicating KV memory by sharing prefixes.}
+\end{figure}
+
+\subsection{Let's look at an implementation: JetStream}
+
+Google has open-sourced a library that implements this logic called \href{https://github.com/google/JetStream}{JetStream}. The server has a set of ``prefill engines'' and ``generate engines'', usually on different TPU slices, which are orchestrated by a single controller. Prefill happens in the ``\href{https://github.com/AI-Hypercomputer/JetStream/blob/c0f83127c16d7861cacc560303a28404c6cbb24c/jetstream/core/orchestrator.py\#L499}{prefill thread}'', while generation happens in the ``\href{https://github.com/AI-Hypercomputer/JetStream/blob/c0f83127c16d7861cacc560303a28404c6cbb24c/jetstream/core/orchestrator.py\#L629}{generate thread}''. We also have a ``\href{https://github.com/AI-Hypercomputer/JetStream/blob/c0f83127c16d7861cacc560303a28404c6cbb24c/jetstream/core/orchestrator.py\#L592}{transfer thread}'' that orchestrates copying the KV caches from the prefill to generate slices.
+
+The Engine interface (implemented \href{https://github.com/google/JetStream/blob/445f1aa8e857d0a09d72618e365daf80723bdf4c/jetstream/engine/engine\_api.py\#L138}{here}) is a generic interface that any LLM must provide. The key methods are:
+
+\begin{itemize}
+\item \textbf{prefill:} takes a set of input tokens and generates a KV cache.
+\item \textbf{insert:} takes a KV cache and inserts it into the batch of KV caches that generate is generating from.
+\item \textbf{generate:} takes a set of batched KV caches and generates one token per batch entry, appending a single token's KV cache to the decode state for each token.
+\end{itemize}
+
+We also have a PyTorch version of JetStream available \href{https://github.com/google/jetstream-pytorch}{here}.

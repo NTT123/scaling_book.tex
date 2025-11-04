@@ -1,0 +1,131 @@
+\section{Takeaways from LLM Training on TPUs}
+
+\begin{itemize}
+\item Increasing parallelism or reducing batch size both tend to make us more communication-bound because they reduce the amount of compute performed per chip.
+
+\item Up to a reasonable context length~($\sim$32k) we can get away with modeling a Transformer as a stack of MLP blocks and define each of several parallelism schemes by how they shard the two/three main matmuls per layer.
+
+\item During training there are 4~main parallelism schemes we consider, each of which has its own bandwidth and compute requirements~(data parallelism, FSDP, tensor parallelism).
+\end{itemize}
+
+{\scriptsize
+\setlength{\tabcolsep}{3pt}
+\begin{longtable}{p{2.5cm}p{5.5cm}}
+\toprule
+\textbf{Strategy} & \textbf{Description} \\
+\midrule
+\textbf{Data Parallelism} & Activations are batch sharded, everything else is fully-replicated, we all-reduce gradients during the backward pass. \\
+\textbf{FSDP} & Activations, weights, and optimizer are batch sharded, weights are gathered just before use, gradients are reduce-scattered. \\
+\textbf{Tensor Parallelism (aka Megatron, Model)} & Activations are sharded along~$d_{\text{model}}$, weights are sharded along~$d_{ff}$, activations are gathered before~$W_{\text{in}}$, the result reduce-scattered after~$W_{\text{out}}$. \\
+\textbf{Mixed FSDP + Tensor Parallelism} & Both of the above, where FSDP gathers the model sharded weights. \\
+\bottomrule
+\end{longtable}
+}
+
+And here are the ``formulas'' for each method:
+
+{\scriptsize
+\setlength{\tabcolsep}{2pt}
+\begin{longtable}{p{2cm}p{7.5cm}}
+\toprule
+\textbf{Strategy} & \textbf{Formula} \\
+\midrule
+DP & $\text{In}[B_X, D] \cdot_D W_{\text{in}}[D, F] \cdot_F W_{\text{out}}[F, D] \rightarrow \text{Out}[B_X, D]$ \\
+FSDP & $\text{In}[B_X, D] \cdot_D W_{\text{in}}[D_X, F] \cdot_F W_{\text{out}}[F, D_X] \rightarrow \text{Out}[B_X, D]$ \\
+TP & $\text{In}[B, D_Y] \cdot_D W_{\text{in}}[D, F_Y] \cdot_F W_{\text{out}}[F_Y, D] \rightarrow \text{Out}[B, D_Y]$ \\
+TP + FSDP & $\text{In}[B_X, D_Y] \cdot_D W_{\text{in}}[D_X, F_Y] \cdot_F W_{\text{out}}[F_Y, D_X] \rightarrow \text{Out}[B_X, D_Y]$ \\
+\bottomrule
+\end{longtable}
+}
+
+\begin{itemize}
+\item Each of these strategies has a limit at which it becomes network/communication bound, based on their per-device compute and comms. Here's compute and comms per-layer, assuming~$X$ is FSDP and~$Y$ is tensor parallelism.
+\end{itemize}
+
+{\scriptsize
+\setlength{\tabcolsep}{3pt}
+\begin{longtable}{p{3cm}p{2.5cm}p{2.5cm}}
+\toprule
+\textbf{Strategy} & \textbf{Compute per layer} & \textbf{Comms per layer} \\
+& \textbf{(ignoring gating einsum)} & \textbf{(bytes, forward + backward pass)} \\
+\midrule
+DP & $4BDF/X + 8BDF/X$ & $0 + 8DF$ \\
+FSDP & $4BDF/X + 8BDF/X$ & $4DF + 8DF$ \\
+TP & $4BDF/Y + 8BDF/Y$ & $4BD + 4BD$ \\
+FSDP + TP & $4BDF/(XY) + 8BDF/(XY)$ & $(4BD/X + 4DF/Y) + (8BD/X + 8DF/Y)$ \\
+\bottomrule
+\end{longtable}
+}
+
+\begin{itemize}
+\item Pure data parallelism is rarely useful because the model and its optimizer state use bytes~= 10x parameter count. This means we can rarely fit more than a few billion parameters in memory.
+
+\item Data parallelism and FSDP become comms bound when the~$\text{batch size per shard} < C / W$, the arithmetic intensity of the network. For ICI this is~2,550 and for DCN this is~75,000. This can be increased with more parallel axes.
+
+\item Tensor parallelism becomes comms bound when~$|Y| > F / 2550$. \textbf{This is around 8--16~way for most models.} This is independent of the batch size.
+
+\item Mixed FSDP~+ tensor parallelism allows us to drop the batch size to as low as~$2550^2 / 2F \approx 100$. This is remarkably low.
+
+\item Data parallelism across pods requires a minimum batch size per pod of roughly~75,000 before becoming DCN-bound.
+
+\item Basically, if your batch sizes are big or your model is small, things are simple. You can either do data parallelism or FSDP~+ data parallelism across DCN. The middle section is where things get interesting.
+\end{itemize}
+
+\section{Some Problems to Work}
+
+Let's use LLaMA-2~13B as a basic model for this section. Here are the model details:
+
+{\scriptsize
+\setlength{\tabcolsep}{3pt}
+\begin{longtable}{p{2cm}p{6cm}}
+\toprule
+\textbf{hyperparam} & \textbf{value} \\
+\midrule
+L & 40 \\
+D & 5,120 \\
+F & 13824 \\
+N & 40 \\
+K & 40 \\
+H & 128 \\
+V & 32,000 \\
+\bottomrule
+\end{longtable}
+}
+
+LLaMA-2 has separate embedding and output matrices and a gated MLP block.
+
+\textbf{Question~1:} How many parameters does LLaMA-2~13B have~(I know that's silly but do the math)? \textit{Note that, as in Transformer Math, LLaMA-3 has 3~big FFW matrices, two up-projection and one down-projection. We ignored the two ``gating'' einsum matrices in this section, but they behave the same as~$W_{\text{in}}$ in this section.}
+
+\textbf{Question~2:} Let's assume we're training with BS=16M tokens and using Adam. Ignoring parallelism for a moment, how much total memory is used by the model's parameters, optimizer state, and activations? \textit{Assume we store the parameters in bf16 and the optimizer state in fp32 and checkpoint activations three times per layer~(after the three big matmuls).}
+
+\textbf{Question~3:} Assume we want to train with 32k~sequence length and a total batch size of 3M~tokens on a TPUv5p 16x16x16~slice. Assume we want to use bfloat16 weights and a float32 optimizer, as above.
+
+\begin{enumerate}
+\item Can we use pure data parallelism? Why or why not?
+\item Can we use pure FSDP? Why or why not? With pure FSDP, how much memory will be used per device~(assume we do gradient checkpointing only after the 3~big FFW matrices).
+\item Can we use mixed FSDP~+ tensor parallelism? Why or why not? If so, what should~$X$ and~$Y$ be? How much memory will be stored per device? Using only roofline FLOPs estimates and ignoring attention, how long will each training step take at~40\% MFU?
+\end{enumerate}
+
+\section{Appendix}
+
+\subsection{Appendix A: Deriving the backward pass comms}
+
+Above, we simplified the Transformer layer forward pass as $\text{Out}[B, D] = \text{In}[B, D] \times_D W_{\text{in}}[D, F] \times_F W_{\text{out}}[F, D]$. How do we derive the comms necessary for the backwards pass?
+
+This follows fairly naturally from the rule in the previous section for a single matmul $\textbf{Y} = \textbf{X} \times \textbf{A}$:
+
+\begin{align*}
+\frac{dL}{dA} &= \frac{dL}{dY}\frac{dY}{dA} = X^T \left(\frac{dL}{dY}\right) \\
+\frac{dL}{dX} &= \frac{dL}{dY}\frac{dY}{dX} = \left(\frac{dL}{dY}\right) A^T
+\end{align*}
+
+Using this, we get the following formulas~(letting $\text{Tmp}[B, F]$ stand for $\text{In}[B, D] \times W_{\text{in}}[D, F]$):
+
+\begin{enumerate}
+\item $\text{dW}_{\text{out}}[F, D] = \text{Tmp}[B, F] *_B \text{dOut}[B, D]$
+\item $\text{dTmp}[B, F] = \text{dOut}[B, D] *_D W_{\text{out}}[F, D]$
+\item $\text{dW}_{\text{in}} = \text{dTmp}[B, F] *_B \text{Tmp}[B, F]$
+\item $\text{dIn}[B, D] = \text{dTmp}[B, F] *_F W_{\text{in}}[D, F]$
+\end{enumerate}
+
+Note that these formulas are mathematical statements, with no mention of sharding. The job of the backwards pass is to compute these four quantities. So to figure out the comms necessary, we just take the shardings of all the quantities which are to be matmulled in the four equations above~(Tmp, dOut, $W_{\text{out}}$, $W_{\text{in}}$), which are specified by our parallelization scheme, and use the rules of sharded matmuls to figure out what comms we have to do. Note that dOut is sharded in the same way as Out.

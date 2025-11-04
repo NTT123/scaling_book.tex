@@ -1,0 +1,70 @@
+\section*{Counting Dots}
+\addcontentsline{toc}{section}{Counting Dots}
+
+Let's start with vectors $x$,$y$ and matrices $A$,$B$ of the following shapes:
+
+$$
+\def \red#1{\textcolor{red}{#1}}
+\def \green#1{\textcolor{green}{#1}}
+\def \blue#1{\textcolor{blue}{#1}}
+\def \purple#1{\textcolor{purple}{#1}}
+\def \orange#1{\textcolor{orange}{#1}}
+\def \gray#1{\textcolor{gray}{#1}}
+
+\begin{array}{cc}
+\textrm{array}  & \textrm{shape} \\ \hline
+x               & \textrm{[P]}   \\
+y               & \textrm{[P]}   \\
+A               & \textrm{[N P]} \\
+B               & \textrm{[P M]} \\
+\hline
+\end {array}
+$$
+
+\begin{itemize}
+\item A dot product of $x \cdot y$ requires $P$ \emph{adds} and \emph{multiplies}, or $2P$ floating-point operations total.
+\item A matrix-vector product $Ax$ does $N$ dot-products along the rows of $A$, for $2NP$ FLOPs.
+\item A matrix-matrix product $AB$ does a matrix-vector product for each of the $M$ columns of $B$, for $2NPM$ FLOPs total.
+\item In general, if we have two higher dimensional arrays $C$ and $D$, where some dimensions are \textcolor{red}{CONTRACTING} and some are \textcolor{blue}{BATCHING}.  (e.g. $C[\textcolor{blue}{GH}IJ\textcolor{red}{KL}], D[\textcolor{blue}{GH}MN\textcolor{red}{KL}]$) then the FLOPs cost of this contraction is two times the product of all of the $C$ and $D$ dimensions where the batch and contraction dimensions are only counted once, (e.g. $2\textcolor{blue}{GH}IJMN\textcolor{red}{KL}$). Note that a dimension is only batching if it occurs in both multiplicands. (Note also that the factor of 2 won't apply if there are no contracting dimensions and this is just an elementwise product.)
+\end{itemize}
+
+{\footnotesize
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+Operation & FLOPs & Data \\
+\midrule
+$x \cdot y$  & $2P$   & $2P$      \\
+$A x$        & $2NP$  & $NP + P$  \\
+$AB$         & $2NPM$ & $NP + PM$ \\
+General einsum & $2 \prod c_i \prod d_j^*$ & $\prod c_i + \prod d_j$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent\textit{*where $d_j^*$ are non-batch, non-contracting dims of $d$}
+}
+
+Make note of the fact that for a matrix-matrix multiply, the \emph{compute} scales cubically $O(N^3)$ while the data transfer only scales quadratically $O(N^2)$ -- this means that as we scale up our matmul size, it becomes \emph{easier} to hit the compute-saturated limit. This is extremely unusual, and explains in large part why we use architectures dominated by matrix multiplication -- they're amenable to being scaled!
+
+\begin{figure}[htb]
+\centering
+\includegraphics[width=\textwidth]{images/matmul-flops.png}
+\end{figure}
+
+\subsection*{Forward and reverse FLOPs}
+\addcontentsline{toc}{subsection}{Forward and reverse FLOPs}
+
+During training, we don't particularly care about the result of a given matrix multiply; we really care about its derivative. That means we do significantly more FLOPs during backpropagation.
+
+If we imagine \textbf{B} is just one matrix in a larger network and \textbf{A} are our input activations with \textbf{C = A B}, the derivative of the loss \textbf{L} with respect to \textbf{B} is given by the chain rule:
+
+$$\frac{\partial L}{\partial B} = \frac{\partial L}{\partial C}\frac{\partial C}{\partial B} = A^T \left(\frac{\partial L}{\partial C}\right)$$
+
+which is an outer product and requires $2NPM$ FLOPs to compute (since it contracts over the $N$ dimension). Likewise, the derivative of the loss with respect to \textbf{A} is
+
+$$\frac{\partial L}{\partial A} = \frac{\partial L}{\partial C}\frac{\partial C}{\partial A} = \left(\frac{\partial L}{\partial C}\right) B^T$$
+
+is again $2NPM$ FLOPs since \textbf{dL/dC} is a (co-)vector of size $[N, M]$. While this quantity isn't the derivative wrt. a parameter, it's used to compute derivatives for previous layers of the network (e.g. just as dL/dC is used to compute dL/dB above).
+
+Adding these up, we see that \textbf{during training, we have a total of 6NPM FLOPs}, compared to 2NPM during inference: 2NPM in the forward pass, 4NPM in the backward pass. Since PM is the number of parameters in the matrix, this is the simplest form of the famous $6 * \text{num parameters} * \text{num tokens}$ approximation of Transformer FLOPs during training: each token requires $6 * \text{num parameters}$ FLOPs. We'll show a more correct derivation below.

@@ -1,0 +1,127 @@
+% Section 1: Partitioning Notation and Collective Operations
+% Lines 89-184 from sharding.md
+
+\section*{Partitioning Notation and Collective Operations}
+\addcontentsline{toc}{section}{Partitioning Notation and Collective Operations}
+
+When we train an LLM on ten thousand TPUs or GPUs, we're still doing abstractly the same computation as when we're training on one. The difference is that \textbf{our arrays don't fit in the HBM of a single TPU/GPU}, so we have to split them.\footnote{It's worth noting that we may also choose to parallelize for speed. Even if we could fit on a smaller number of chips, scaling to more simply gives us more FLOPs/s. During inference, for instance, we can sometimes fit on smaller topologies but choose to scale to larger ones in order to reduce latency. Likewise, during training we often scale to more chips to reduce the step time.} We call this ``\emph{sharding}'' or ``\emph{partitioning}'' our arrays. The art of scaling is figuring out how to shard our models so computation remains efficient.
+
+Here's an example 2D array \textbf{A} sharded across 4 TPUs:
+
+\begin{figure}[htb]
+\centering
+\includegraphics[width=\textwidth]{images/sharding-example.png}
+\caption{An example array of shape \textbf{A}[I, J] gets sharded across 4 devices. Both dimensions are evenly sharded across 2 devices with a sharding \textbf{A}[I$_X$, J$_Y$]. Each TPU holds 1/4 of the total memory.}
+\end{figure}
+
+Note how the sharded array still has the same \emph{global} or \emph{logical shape} as unsharded array, say \texttt{(4, 128)}, but it also has a \emph{device local shape}, like \texttt{(2, 64)}, which gives us the actual size in bytes that each TPU is holding (in the figure above, each TPU holds ¼ of the total array). Now we'll generalize this to arbitrary arrays.
+
+\subsection*{A unified notation for sharding}
+\addcontentsline{toc}{subsection}{A unified notation for sharding}
+
+We use a variant of \emph{named-axis notation} to describe \emph{how} the tensor is sharded in blocks across the devices: we assume the existence of a 2D or 3D grid of devices called the \textbf{device mesh} where each axis has been given \textbf{mesh axis names e.g. X, Y, and Z.} We can then specify how the matrix data is laid out across the device mesh by describing how each named dimension of the array is partitioned across the physical mesh axes. We call this assignment a \textbf{sharding}.
+
+\textbf{Example (the diagram above)}: For the above diagram, we have:
+\begin{itemize}
+\item \textbf{Mesh:} the device mesh above \texttt{Mesh(devices=((0, 1), (2, 3)), axis\_names=('X', 'Y'))}, which tells us we have 4 TPUs in a 2x2 grid, with axis names $X$ and $Y$.
+\item \textbf{Sharding:} $A[I_X, J_Y]$, which tells us to shard the first axis, $I$, along the mesh axis $X$, and the second axis, $J$, along the mesh axis $Y$. This sharding tells us that each shard holds $1 / (\lvert X\rvert \cdot \lvert Y\rvert)$ of the array.
+\end{itemize}
+
+Taken together, we know that the local shape of the array (the size of the shard that an individual device holds) is $(\lvert I\rvert / 2, \lvert J\rvert / 2)$, where $\lvert I\rvert$ is the size of A's first dimension and $\lvert J\rvert$ is the size of A's second dimension.
+
+\textbf{\textcolor{blue!60!black}{Pop Quiz [2D sharding across 1 axis]:}} Consider an array \texttt{fp32[1024, 4096]} with sharding $A[I_{XY}, J]$ and mesh \texttt{\{'X': 8, 'Y': 2\}}. How much data is held by each device? How much time would it take to load this array from HBM on H100s (assuming \texttt{3.4e12} memory bandwidth per chip)?
+
+\textbf{Visualizing these shardings:} Let's try to visualize these shardings by looking at a 2D array of data split over 4 devices:
+
+\begin{figure}[htb]
+\centering
+\includegraphics[width=\textwidth]{images/sharding-colored1.png}
+\end{figure}
+
+We write the \emph{fully-replicated} form of the matrix simply as $A[I, J]$ with no sharding assignment. This means that \emph{each} device contains a full copy of the entire matrix.
+
+\begin{figure}[htb]
+\centering
+\includegraphics[width=\textwidth]{images/sharding-colored2.png}
+\end{figure}
+
+We can indicate that one of these dimensions has been partitioned across a mesh axis with a subscript mesh axis. For instance $A[I_X, J]$ would mean that the \textbf{I} logical axis has been partitioned across the \textbf{X} mesh dimension, but that the \textbf{J} dimension is \emph{not} partitioned, and the blocks remain \emph{partially-replicated} across the \textbf{Y} mesh axis.
+
+\begin{figure}[htb]
+\centering
+\includegraphics[width=\textwidth]{images/sharding-colored3.png}
+\end{figure}
+
+$A[I_X, J_Y]$ means that the \textbf{I} logical axis has been partitioned across the \textbf{X} mesh axis, and that the \textbf{J} dimension has been partitioned across the \textbf{Y} mesh axis.
+
+\begin{figure}[htb]
+\centering
+\includegraphics[width=\textwidth]{images/sharding-colored4.png}
+\end{figure}
+
+We illustrate the other possibilities in the figure below:
+
+\begin{figure}[htb]
+\centering
+\includegraphics[width=\textwidth]{images/sharding-colored5.png}
+\end{figure}
+
+Here $A[I_{XY}, J]$ means that we treat the \textbf{X} and \textbf{Y} mesh axes as a larger flattened dimension and partition the \textbf{I} named axis across all the devices. The order of the multiple mesh-axis subscripts matters, as it specifies the traversal order of the partitioning across the grid.
+
+\begin{figure}[htb]
+\centering
+\includegraphics[width=\textwidth]{images/sharding-colored6.png}
+\end{figure}
+
+Lastly, note that we \emph{cannot} have multiple named axes sharded along the \emph{same} mesh dimension. e.g. $A[I_X, J_X]$ is a nonsensical, forbidden sharding. Once a mesh dimension has been used to shard one dimension of an array, it is in a sense ``spent''.
+
+\textbf{\textcolor{green!60!black}{Pop Quiz:}} Let \textbf{A} be an array with shape \texttt{int8[128, 2048]}, sharding $A[I_{XY}, J]$, and mesh \texttt{Mesh(\{'X': 2, 'Y': 8, 'Z': 2\})} (so 32 devices total). How much memory does \textbf{A} use per device? How much total memory does \textbf{A} use across all devices?
+
+\subsection*{How do we describe this in code?}
+\addcontentsline{toc}{subsection}{How do we describe this in code?}
+
+So far we've avoided talking about code, but now is a good chance for a sneak peek. JAX uses a named sharding syntax that very closely matches the abstract syntax we describe above. We'll talk more about this in Section 10, but here's a quick preview. You can play with this in a Google Colab and profile the result to see how JAX handles different shardings. This snippet does 3 things:
+
+\begin{enumerate}
+\item Creates a \textbf{jax.Mesh} that maps our 8 TPUs into a 4x2 grid with names `X' and `Y' assigned to the two axes.
+\item Creates matrices A and B where A is sharded along both its dimensions and B is sharded along the output dimension.
+\item Compiles and performs a simple matrix multiplication that returns a sharded array.
+\end{enumerate}
+
+\begin{Shaded}
+\begin{Highlighting}[]
+\ImportTok{import}\NormalTok{ jax}
+\ImportTok{import}\NormalTok{ jax.numpy }\ImportTok{as}\NormalTok{ jnp}
+
+\CommentTok{\# Create mesh: TPU v2{-}8 in 4x2 grid}
+\ControlFlowTok{assert} \BuiltInTok{len}\NormalTok{(jax.devices()) }\OperatorTok{==} \DecValTok{8}
+\NormalTok{mesh }\OperatorTok{=}\NormalTok{ jax.make\_mesh(}
+\NormalTok{    axis\_shapes}\OperatorTok{=}\NormalTok{(}\DecValTok{4}\NormalTok{, }\DecValTok{2}\NormalTok{),}
+\NormalTok{    axis\_names}\OperatorTok{=}\NormalTok{(}\StringTok{\textquotesingle{}X\textquotesingle{}}\NormalTok{, }\StringTok{\textquotesingle{}Y\textquotesingle{}}\NormalTok{))}
+
+\CommentTok{\# Helper to define sharding}
+\KeywordTok{def} \FunctionTok{P}\NormalTok{(}\OperatorTok{*}\NormalTok{args):}
+  \ControlFlowTok{return}\NormalTok{ jax.NamedSharding(}
+\NormalTok{      mesh,}
+\NormalTok{      jax.sharding.PartitionSpec(}\OperatorTok{*}\NormalTok{args))}
+
+\CommentTok{\# Shard A over both dims, B over output}
+\NormalTok{A }\OperatorTok{=}\NormalTok{ jnp.zeros(}
+\NormalTok{    (}\DecValTok{8}\NormalTok{, }\DecValTok{2048}\NormalTok{),}
+\NormalTok{    dtype}\OperatorTok{=}\NormalTok{jnp.bfloat16,}
+\NormalTok{    device}\OperatorTok{=}\FunctionTok{P}\NormalTok{(}\StringTok{\textquotesingle{}X\textquotesingle{}}\NormalTok{, }\StringTok{\textquotesingle{}Y\textquotesingle{}}\NormalTok{))}
+
+\NormalTok{B }\OperatorTok{=}\NormalTok{ jnp.zeros(}
+\NormalTok{    (}\DecValTok{2048}\NormalTok{, }\DecValTok{8192}\NormalTok{),}
+\NormalTok{    dtype}\OperatorTok{=}\NormalTok{jnp.bfloat16,}
+\NormalTok{    device}\OperatorTok{=}\FunctionTok{P}\NormalTok{(}\VariableTok{None}\NormalTok{, }\StringTok{\textquotesingle{}Y\textquotesingle{}}\NormalTok{))}
+
+\CommentTok{\# Matmul on sharded arrays}
+\NormalTok{y }\OperatorTok{=}\NormalTok{ jax.jit(}
+    \KeywordTok{lambda}\NormalTok{ A, B: jnp.einsum(}
+\NormalTok{        }\StringTok{\textquotesingle{}BD,DF{-}\textgreater{}BF\textquotesingle{}}\NormalTok{, A, B),}
+\NormalTok{    out\_shardings}\OperatorTok{=}\FunctionTok{P}\NormalTok{(}\StringTok{\textquotesingle{}X\textquotesingle{}}\NormalTok{, }\StringTok{\textquotesingle{}Y\textquotesingle{}}\NormalTok{))(A, B)}
+\end{Highlighting}
+\end{Shaded}
+
+The cool thing about JAX is that these arrays behave as if they're unsharded! \texttt{B.shape} will tell us the global or logical shape (2048, 8192). We have to actually look at \texttt{B.addressable\_shards} to see how it's locally sharded. We can perform operations on these arrays and JAX will attempt to figure out how to broadcast or reshape them to perform the operations. For instance, in the above example, the local shape of \textbf{A} is \texttt{[2, 1024]} and for \textbf{B} is \texttt{[2048, 4096]}. JAX/XLA will automatically add communication across these arrays as necessary to perform the final multiplication.

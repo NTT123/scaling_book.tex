@@ -1,0 +1,46 @@
+\section{Miscellaneous Math}
+
+\subsection{Sparsity and Mixture-of-Experts}
+
+We'd be remiss not to briefly discuss Mixture of Experts (MoE) models~\cite{moe}, which replace the single dense MLP blocks in a standard Transformer with a set of independent MLPs that can be dynamically routed between. To a first approximation, \textbf{an MoE is just a normal dense model with E MLP blocks per layer}, instead of just one. Each token activates $k$ of these experts, typically $k=2$. This increases the parameter count by $O(E)$, while multiplying the total number of activated parameters per token by $k$, compared with the dense version.
+
+\begin{figure}[htb]
+    \centering
+    \includegraphics[width=\textwidth]{images/moe.png}
+    \caption{An example MoE layer with $n$ experts. The gating expert routes each token to $k$ of them, and the output of those $k$ MLPs get summed. Our parameter count is $n$ times the size of each expert, but only $k$ are used for each token. \href{https://deepgram.com/learn/mixture-of-experts-ml-model-guide}{Source}.}
+    \label{fig:moe}
+\end{figure}
+
+Compared to a dense model, an MoE introduces new comms, primarily two AllToAlls (one before and one after the MoE block) that route tokens to the correct expert and bring them back to their home device.\footnote{Technically, this only happens if we are data or sequence sharded along the same axis as our experts.} However as we saw in the previous section, the cost of each AllToAll is only 1/4 that of a comparable AllGather along a single axis (for a bidirectional ring).
+
+\subsection{Gradient checkpointing}
+
+Backpropagation as an algorithm trades memory for compute. Instead of a backward pass requiring $O(n_\text{layers}^2)$ FLOPs, \textbf{it requires $O(n_\text{layers})$ memory}, saving all intermediate activations generated during the forward pass. While this is better than quadratic compute, it's incredibly expensive memory-wise: a model with $B \cdot T=4M$ (4M total tokens per batch), L=64, and D=8192 that avoids all unnecessary backward pass compute would have to save roughly $2 \cdot 20 \cdot B \cdot T \cdot D \cdot L = 84TB$ of activations in bfloat16. 20 comes from (roughly) counting every intermediate node in the Transformer diagram above, since e.g.
+
+\begin{equation}
+f(x) = \exp(g(x))
+\end{equation}
+
+\begin{equation}
+\frac{df}{dx} = \exp(g(x)) \cdot \frac{dg}{dx}
+\end{equation}
+
+so to avoid recomputing we need to save $g(x)$ and $\exp(g(x))$ from the forward pass. To avoid saving this much memory, we can choose to only save some fraction of the intermediate activations. Here are a few strategies we use.
+
+\begin{itemize}
+    \item \textbf{Block remat}: only save the input to each layer. This is the most aggressive method we use and only saves 1 checkpoint per layer, meaning we'd only save 4.2TB in the example above. This forces us to repeat essentially all forward pass FLOPs in the backward pass, meaning we increase our FLOPs from $6ND$ to roughly $8ND$.
+    \item \textbf{Big matmuls only:} another simple policy is to only save the outputs of large matmuls. This lets us avoid recomputing any large matmuls during the backward pass, but still makes us recompute other activation functions and parts of attention. This reduces 20 per layer to closer to 7 per layer.
+\end{itemize}
+
+This by no means comprehensive. When using JAX, these are typically controlled by \texttt{jax.remat}/\texttt{jax.checkpoint} (you can read more \href{https://jax.readthedocs.io/en/latest/_autosummary/jax.checkpoint.html}{here}).
+
+\subsection{Key-Value (KV) caching}
+
+As we'll see in Section 7, LLM inference has two key parts, prefill and generation.
+
+\begin{itemize}
+    \item \textbf{Prefill} processes a long prompt and saves its attention activations in a Key-Value Cache (KV Cache) for use in generation, specifically the key-value projections in the attention block.
+    \item \textbf{Generation} batches several of these KV caches together and samples tokens from each of them.
+\end{itemize}
+
+Each KV cache is then effectively an array of size $[2, S, L, K, H]$ where the 2 accounts for the keys and values. This is quite large! The total size of the Key-Value cache in int8 is $2SLKH$. For a moderately-sized model with 8k context length, 64 layers, and $KH = NH = D = 8192$, this is $2 \cdot 8192 \cdot 64 \cdot 8192 = 8\text{GiB}$. You can see why we would want to use GMQA with $K \ll N$.

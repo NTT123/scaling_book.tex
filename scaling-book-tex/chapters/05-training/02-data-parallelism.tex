@@ -1,0 +1,93 @@
+\subsection{Data Parallelism}
+
+\textbf{Syntax:} $\text{In}[B_X, D] \cdot_D W_\text{in}[D, F] \cdot_F W_\text{out}[F, D] \rightarrow \text{Out}[B_X, D]$
+
+When your model fits on a single chip with even a tiny batch size (>240 tokens, so as to be compute-bound), \textbf{you should always use simple data parallelism.} Pure data parallelism splits our activations across any number of TPUs so long as the number of TPUs is smaller than our batch size. The forward pass involves no communication, but at the end of every step, \textbf{each TPU performs an AllReduce on its local gradients to synchronize them before updating the parameters.}
+
+\begin{figure}[htb]
+\centering
+\includegraphics[width=\textwidth]{images/data-parallelism.png}
+\caption{Pure data parallelism (forward pass). Our activations (left) are fully sharded along the batch dimension and our weights are fully replicated, so each TPU has an identical copy of the weights. This means the total memory of our weights is increased by a factor of N, but no communication is required on the forward-pass.}
+\end{figure}
+
+\begin{algorithmbox}
+\textbf{Pure Data Parallelism Algorithm:}
+
+\textbf{Forward pass:} need to compute Loss[$B_X$]
+
+\begin{enumerate}
+    \item Tmp[$B_X$, F] = In[$B_X$, D] $*_D$ $W_{\text{in}}$[D, F]
+    \item Out[$B_X$, D] = Tmp[$B_X$, F] $*_F$ $W_{\text{out}}$[F, D]
+    \item Loss[$B_X$] = ...
+\end{enumerate}
+
+\textbf{Backward pass:} need to compute $\text{dW}_{\text{out}}$[F, D], $\text{dW}_{\text{in}}$[D, F]
+
+\begin{enumerate}
+    \item dOut[$B_X$, D] = ...
+    \item $\text{dW}_{\text{out}}$[F, D] \{$U_X$\} = Tmp[$B_X$, F] $*_B$ dOut[$B_X$, D]
+    \item $\text{dW}_{\text{out}}$[F, D] = \textbf{AllReduce}($\text{dW}_{\text{out}}$[F, D] \{$U_X$\}) (\textit{not on critical path, can be done async})
+    \item dTmp[$B_X$, F] = dOut[$B_X$, D] $*_D$ $W_{\text{out}}$[F, D]
+    \item $\text{dW}_{\text{in}}$[D, F] \{$U_X$\} = In[$B_X$, D] $*_B$ dTmp[$B_X$, F]
+    \item $\text{dW}_{\text{in}}$[D, F] = \textbf{AllReduce}($\text{dW}_{\text{in}}$[D, F] \{$U_X$\}) (\textit{not on critical path, can be done async})
+    \item dIn[$B_X$, D] = dTmp[$B_X$, F] $*_F$ $W_{\text{in}}$[D, F] (\textit{needed for previous layers})
+\end{enumerate}
+\end{algorithmbox}
+
+We ignore the details of the loss function and abbreviate $\text{Tmp} = W_\text{in} \cdot \text{In}$.~ Note that, although our final loss is the average \textbf{AllReduce}(Loss[$B_X$]), we only need to compute the AllReduce on the backward pass when averaging weight gradients.
+
+Note that the forward pass has no communication --- \textbf{it's all in the backward pass}! The backward pass also has the great property that the AllReduces aren't in the ``critical path'', meaning that each AllReduce can be performed whenever it's convenient and doesn't block you from performing subsequent operations. The overall communication cost \textit{can still bottleneck us} if it exceeds our total compute cost, but it is much more forgiving from an implementation standpoint. We'll see that model/tensor parallelism doesn't have this property.
+
+\textbf{Why do this?} Pure data parallelism reduces activation memory pressure by splitting our activations over the batch dimension, allowing us to almost arbitrarily increase batch size as long as we have more chips to split the batch dimension over. Especially during training when our activations often dominate our memory usage, this is very helpful.
+
+\textbf{Why not do this?} Pure data parallelism does nothing to reduce memory pressure from model parameters or optimizer states, which means pure data parallelism is rarely useful for interesting models at scale where our parameters + optimizer state don't fit in a single TPU. To give a sense of scale, if we train with parameters in bf16 and optimizer state in fp32 with Adam\footnote{Adam stores parameters, first order and second order accumulators. Since the params are in bfloat16 and optimizer state is in float32, this gives us \texttt{2 + 8 = 10} bytes per parameters.}, the largest model we can fit has $\text{TPU memory} / 10$ parameters, so e.g. on a TPUv5p chip with 96GB of HBM and pure data parallelism this is about 9B parameters.
+
+\begin{takeawaybox}
+The largest model we can train with Adam and pure data parallelism has $\text{num\_params} = \text{HBM per device} / 10$.~ For TPU v5p this is roughly 9B parameters.\footnote{Note that this doesn't include gradient checkpoints, so this wouldn't actually be useful. This is an absolute lower bound with a batch of 1 token.}
+\end{takeawaybox}
+
+\textit{To make this useful for real models during training, we'll need to at least partly shard the model parameters or optimizer.}
+
+\textbf{When do we become bottlenecked by communication?} As we can see above, we have two AllReduces per layer, each of size $2DF$ (for bf16 weights). When does data parallelism make us communication bound?
+
+As in the table above, let $C$ = per-chip FLOPs, $W_{\text{ici}}$ = \textbf{bidirectional} network bandwidth, and $X$ = number of shards across which the batch is partitioned\footnote{We assume this partitioning is done over an ICI mesh, so the relevant network bandwidth is $W_\text{ici}$}.~ Let's calculate the time required to perform the relevant matmuls, $T_\text{math}$,~ and the required communication time $T_\text{comms}$.~ Since this parallelism scheme requires no communication in the forward pass, we only need to calculate these quantities for the backwards pass.
+
+\textit{Communication time:} From a previous section we know that the time required to perform an AllReduce in a 1D mesh depends only on the total bytes of the array being AllReduced and the ICI bandwidth $W_\text{ici}$;~ specifically the AllReduce time is $2 \cdot \text{total bytes} / W_\text{ici}$.~ Since we need to AllReduce for both $W_\text{in}$ and $W_\text{out}$,~ we have 2 AllReduces per layer. Each AllReduce is for a weight matrix, i.e. an array of $DF$ parameters, or $2DF$ bytes. Putting this all together, the total time for the AllReduce in a single layer is
+
+$$\begin{align}
+T_\text{comms} &= \frac{2 \cdot 2 \cdot 2 \cdot D \cdot F}{W_\text{ici}}.
+\end{align}$$
+
+\textit{Matmul time:} Each layer comprises two matmuls in the forward pass, or four matmuls in the backwards pass, each of which requires $2(B/X)DF$ FLOPs. Thus, for a single layer in the backward pass, we have
+
+$$\begin{align}
+T_\text{math} &= \frac{2 \cdot 2 \cdot 2 \cdot B \cdot D \cdot F}{X \cdot C}
+\end{align}$$
+
+Since we overlap, the total time per layer is the max of these two quantities:
+
+$$\begin{aligned}
+T &\approx \max(\frac{8 \cdot B \cdot D \cdot F}{X \cdot C}, \frac{8 \cdot D \cdot F}{W_\text{ici}}) \\
+T &\approx 8 \cdot D \cdot F \cdot \max(\frac{B}{X \cdot C}, \frac{1}{W_\text{ici}})
+\end{aligned}$$
+
+We become compute-bound when $T_\text{math}/T_\text{comms} > 1$,~ or when
+
+$$\begin{align}
+\frac{B}{X} > \frac{C}{W_\text{ici}}.
+\end{align}$$
+
+The upshot is that, to remain compute-bound with data parallelism, we need the per-device batch size $B / X$ to exceed the ICI operational intensity, $C / W_\text{ici}$.~ This is ultimately a consequence of the fact that the computation time scales with the per-device batch size, while the communication time is independent of this quantity (since we are transferring model weights). Note the resemblance of the $B > C/W_\text{ici}$ condition to the single-device compute-bound rule $B > 240$;~ in that case as well, the rule came from the fact that computation time scaled with batch size while data-transfer size was (in the $B \ll F, D$ regime) independent of batch size.
+
+Let's put in some real numbers to get a sense of scale. For TPUv5p, \texttt{C=4.6e14} and \texttt{W=2 * 9e10} for 1D data parallelism over ICI, so \textbf{our batch size per chip must be at least 2,550 to avoid being communication-bound}. Since we can do data parallelism over multiple axes, if we dedicate all three axes of a TPUv5p pod to pure data parallelism, we 3x our bandwidth $W_\text{ici}$ and can scale down to only BS=850 per TPU or 7.6M tokens per batch per pod (of 8960 chips)! \textbf{This tells us that it's fairly hard to become bottlenecked by pure data parallelism!}
+
+\begin{takeawaybox}
+\textbf{Note [context parallelism]:} Throughout this section, $B$ always refers to the total batch size \textbf{in tokens}. Clearly, however, our batch is made up of many different sequences, so how does this work? As far as the MLP is concerned, \textbf{tokens are tokens}! It doesn't matter if they belong to the same sequence or two different sequences. So we are more or less free to do data parallelism over both the batch and sequence dimension: we call this context parallelism or sequence parallelism, but you can think of it as simply being another kind of data parallelism. Attention is trickier than the MLP since we do some cross-sequence computation, but this can be handled by gathering KVs or Qs during attention and carefully overlapping FLOPs and comms (typically using something called ``ring attention''). Throughout this section, we will just ignore our sequence dimension entirely and assume some amount of batch or sequence parallelism.
+\end{takeawaybox}
+
+\textbf{Note on multiple mesh axes:} We should quickly note how multiple axes affects the available bandwidth. When we use multiple mesh axes for a given parallelism strategy, we get more bandwidth.
+
+\begin{itemize}
+    \item \textbf{Definition:} $M_X$ ($M_Y$, $M_Z$, etc.) is the number of hardware mesh axes that a given parallelism strategy spans.
+    \item \textbf{Effect (bandwidth-bound):} Using $M$ axes provides ($\approx M$ times) aggregate link bandwidth, so collective time scales $\propto 1/M_X$.~
+\end{itemize}

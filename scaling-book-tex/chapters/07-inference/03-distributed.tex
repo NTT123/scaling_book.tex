@@ -1,0 +1,96 @@
+\section{Distributing Inference Over Multiple Accelerators}
+
+So far we've handwaved how we're scaling beyond a single chip. Following Section 5, let's explore the different strategies available to us and their tradeoffs. As always, we will look at prefill and generation separately.
+
+\subsection{Prefill}
+
+From a roofline standpoint, \textbf{prefill is almost identical to training} and almost all the same techniques and tradeoffs apply---model (Megatron) parallelism, sequence sharding (for sufficiently long context), pipelining, even FSDP are all viable! You just have to keep the KVs kicking around so you can do generation later. As in training, increasing the number of chips gives us access to more FLOPs/s (for potentially lower TTFT), but adds communication overhead (potentially reducing throughput per chip).
+
+\textbf{The general rule for sharding prefill:} here's a general set of rules for prefill. We'll assume we're doing prefill on a single sequence only (no batch dimension):
+
+\begin{enumerate}
+\item \textit{Model sharding:} We typically do some amount of model parallelism first, up to the point we become ICI-bound. As we saw in Section 5, this is around $F / 2200$~ for 1 axis (usually around 4-8 way sharding).
+\item \textit{Sequence parallelism:} Beyond this, we do sequence parallelism (like data parallelism but sharding across the sequence dimension). While sequence parallelism introduces some extra communication in attention, it is typically fairly small at longer contexts. As with training, we can overlap the communication and computation (using collective matmuls for Megatron and ring attention respectively).
+\end{enumerate}
+
+
+\begin{takeawaybox}
+during prefill, almost any sharding that can work during training can work fine. Do model parallelism up to the ICI bound, then do sequence parallelism.
+\end{takeawaybox}
+
+
+\subsection{Generation}
+
+Generation is a more complicated beast than prefill. For one thing, it is harder to get a large batch size because we need to batch many requests together. Latency targets are lower. Together, these mean we are typically more memory-bound and more sensitive to communication overhead, which restrict our sharding strategies:
+
+\begin{enumerate}
+\item \textbf{FSDP is impossible:} since we are memory-bound in loading our parameters and KV caches from HBM to the MXU, we do not want to move them via ICI which is orders of magnitudes slower than HBM. \textit{We want to move activations rather than weights.} This means methods similar to FSDP are usually completely unviable for generation.\footnote{Accidentally leaving it on after training is an easy and common way to have order of magnitude regressions}
+
+\item \textbf{There is no reason to do data parallelism:} pure data parallelism is unhelpful because it replicates our parameters and doesn't help us load parameters faster. You're better off spinning up multiple copies of the model instead.\footnote{By this we mean, spin up multiple servers with copies of the model at a smaller batch size. Data parallelism at the model level is strictly worse.}
+
+\item \textbf{No sequence = no sequence sharding.} Good luck sequence sharding.
+\end{enumerate}
+
+\textit{This mostly leaves us with variants of model sharding for dense model generation}. As with prefill, the simplest thing we we can do is simple model parallelism (with activations fully replicated, weights fully sharded over hidden dimension for the MLP) up to 4-8 ways when we become ICI bound. However, since we are often memory bandwidth bound, we can actually go beyond this limit to improve latency!
+
+\textbf{Note on ICI bounds for generation:} during training we want to be compute-bound, so our rooflines look at when our ICI comms take longer than our FLOPs. However, during generation, if we're memory bandwidth bound by parameter loading, we can increase model sharding beyond this point and improve latency at a minimal throughput cost (in terms of tokens/sec/chip). More model sharding gives us more HBM to load our weights over, and our FLOPs don't matter.\footnote{In the sense that FLOPs time isn't bottlenecking us, so the thing we need to worry about is ICI time exceeding parameter loading time.} Let's look at how much model parallelism we can do before it becomes the bottleneck.
+
+\begin{align*}
+T_\text{HBM comms} &= \frac{2DF}{Y \cdot W_\text{hbm}} \\
+T_\text{ICI comms} &= \frac{2BD}{W_\text{ici}}
+\end{align*}
+
+\begin{align*}
+T_\text{ICI comms} > T_\text{HBM comms} &\rightarrow \frac{W_\text{hbm}}{W_\text{ici}} > \frac{F}{Y \cdot B} \\
+&\rightarrow Y > F / (B \cdot \beta)
+\end{align*}
+
+where $\beta = W_\text{hbm} / W_\text{ici}$~ This number is usually around 8 for TPU v5e and TPU v6e. That means e.g. if $F$~ is 16,384 and $B$~ is 32, we can in theory do model parallelism up to \texttt{16384 / (32 * 8) = 64}~ ways without a meaningful hit in throughput. This assume we can fully shard our KV caches 64-ways which is difficult: we discuss this below.
+
+For the attention layer, we also model shard attention $W_Q$~ and $W_O$~ over heads Megatron style. The KV weights are quite small, and replicating them is often cheaper than sharding beyond $K$-way sharding.
+
+
+\begin{takeawaybox}
+our only options during generation are variants of model parallelism. We aim to move activations instead of KV caches or parameters, which are larger. When our batch size is large, we do model parallelism up to the FLOPs-ICI bound ($F / \alpha$). When our batch size is smaller, we can improve latency by model sharding more (at a modest throughput cost). When we want to model shard more ways than we have KV heads, we can shard our KVs along the batch dimension as well.
+\end{takeawaybox}
+
+
+\subsection{Sharding the KV cache}
+
+\textbf{We also have an additional data structure that needs to be sharded---the KV cache.} Again, we almost always prefer to avoid replicating the cache, since it is the primary source of attention latency. To do this, we first Megatron-shard the KVs along the head dimension. This is limited to $K$-way sharding, so for models with a small number of heads, we shard the head dimension as much as possible and then shard along the batch dimension, i.e. $\text{KV}[2, B_Z, S, K_Y, H]$~ This means the KV cache is completely distributed.
+
+\begin{figure}[htb]
+\centering
+\includegraphics[width=\textwidth]{images/esta-figure.png}
+\caption{comparison of the attention mechanism with (a) Multi head attention with pure model sharding and (b) Multiquery attention with batch sharding of the KV cache. Notice how we need two extra AllToAlls to shift the activations from model sharding to batch sharding, so they can act on the KV caches.}
+\end{figure}
+
+The cost of this is two AllToAlls every attention layer---one to shift the Q activations to the batch sharding so we can compute attention with batch sharding, and one to shift the batch sharded attention output back to pure model sharded.
+
+
+\textbf{Here's the full algorithm!}
+
+
+Here we'll write out the full attention algorithm with model parallelism over both $Y$~ and $Z$~ I apologize for using $K$~ for both the key tensor and the KV head dimension. Let $M=N/K$.
+
+\begin{enumerate}
+\item X[B, D] = ... (existing activations, unsharded from previous layer)
+\item K[B\textsubscript{Z}, S, K\textsubscript{Y}, H], V[B\textsubscript{Z}, S, K, H] = ... (existing KV cache, batch sharded)
+\item Q[B, N\textsubscript{YZ}, H] = X[B, D] * W\textsubscript{Q}[D, N\textsubscript{YZ}, H]
+\item Q[B\textsubscript{Z}, N\textsubscript{Y}, H] = \textbf{AllToAll}\textsubscript{Z->B}(Q[B, N\textsubscript{YZ}, H])
+\item Q[B\textsubscript{Z}, K\textsubscript{Y}, M, H] = \textbf{Reshape}(Q[B\textsubscript{Z}, N\textsubscript{Y}, H])
+\item O[B\textsubscript{Z}, S, K\textsubscript{Y}, M] = Q[B\textsubscript{Z}, K\textsubscript{Y}, M, H] *\textsubscript{H} K[B\textsubscript{Z}, S, K\textsubscript{Y}, H]
+\item O[B\textsubscript{Z}, S, K, M] = \textbf{Softmax}\textsubscript{S}(O[B\textsubscript{Z}, S, K\textsubscript{Y}])
+\item O[B\textsubscript{Z}, K\textsubscript{Y}, M, H] = O[B\textsubscript{Z}, S, K, M] *\textsubscript{S} V[B\textsubscript{Z}, S, K\textsubscript{Y}, H]
+\item O[B, K\textsubscript{Y}, M\textsubscript{Z}, H] = \textbf{AllToAll}\textsubscript{Z->M}(O[B\textsubscript{Z}, K\textsubscript{Y}, M, H])
+\item O[B, N\textsubscript{YZ}, H] = \textbf{Reshape}(O[B, K\textsubscript{Y}, M\textsubscript{Z}, H])
+\item X[B, D] \{U\textsubscript{YZ}\} = W\textsubscript{O}[N\textsubscript{YZ}, H, D] *\textsubscript{N,H} O[B, N\textsubscript{YZ}, H]
+\item X[B, D] = \textbf{AllReduce}(X[B, D] \{ U\textsubscript{YZ}\})
+\end{enumerate}
+
+This is pretty complicated but you can see generally how it works. The new comms are modestly expensive since they operate on our small activations, while in return we save a huge amount of memory bandwidth loading the KVs (which are stationary).
+
+
+\begin{itemize}
+\item \textbf{Sequence sharding:} If the batch size is too small, or the context is long, we can sequence shard the KV cache. Again, we pay a collective cost in accumulating the attention across shards here. First we need to AllGather the Q activations, and then accumulate the KVs in a similar fashion to Flash Attention.
+\end{itemize}

@@ -1,0 +1,38 @@
+\section{Tricks for Improving Generation Throughput and Latency}
+
+Since the original \href{https://arxiv.org/abs/1706.03762}{Attention is All You Need paper}, many techniques have been developed to make the model more efficient, often targeting the KV cache specifically. Generally speaking, a smaller KV cache makes it easier to increase batch size and context length of the generation step without hurting latency, and makes life easier for the systems surrounding the Transformer (like request caching). Ignoring effects on quality, we may see:
+
+\textbf{Grouped multi-query attention (aka GMQA, GQA):} We can reduce the number of KV heads, and share them with many Q heads in the attention mechanism. In the extreme case, it is possible to share a single KV head across all Q heads.  This reduces the KV cache by a factor of the Q:KV ratio over pure MHA, and it has been observed that the performance of models is relatively insensitive to this change.
+
+\begin{figure}[htb]
+\centering
+\includegraphics[width=\textwidth]{images/gmqa.png}
+\end{figure}
+
+This also effectively increases the arithmetic intensity of the attention computation (see Question 4 in Section 4).
+
+\textbf{Mixing in some local attention layers:} Local attention caps the context to a small to moderately sized max length. At training time and prefill time, this involves masking the attention matrix to a diagonal strip instead of a triangle. This effectively caps the size of the max length of the KV cache for the local layers. By mixing in some local layers into the model with some global layers, the KV cache is greatly reduced in size at contexts longer than the local window.
+
+\textbf{Sharing KVs across layers:} The model can learn to share the same KV caches across layers in some pattern. Whilst this does reduce the KV cache size, and provide benefits in increasing batch size, caching, offline storage etc. shared KV caches may need to be read from HBM multiple times, \textit{so it does not necessarily improve the step time.}
+
+\begin{figure}[htb]
+\centering
+\includegraphics[width=\textwidth]{images/kv-sharing.png}
+\caption{\textbf{Left:} Multiple layers of pure global attention. \textbf{Right:} An example of some global/local interleaving pattern with sharing with adjacent layers.}
+\end{figure}
+
+\textbf{Quantization:} Inference is usually less sensitive to the precision of parameters and KVs. By quantizing the parameters and KV cache (e.g. to int8, int4, \texttt{fp8} etc.), we can save on memory bandwidth on both, decrease the batch size required to reach the compute roofline and save memory to run at bigger batch sizes. Quantization has the added advantage that even if the model was not trained with quantization it can often be applied post training.
+
+\textbf{Using ragged HBM reads and Paged Attention:} We allocated 8k of context for each KV cache in the calculations above but it is often not necessary to read the entire KV cache from memory---requests have a wide range of length distributions and don't use the max context of the model, so we can often implement kernels (e.g. Flash Attention variants) that only read the non-padding part of the KV cache.
+
+Paged Attention~\cite{paged} is a refinement upon this that stores KV caches in OS-style page tables and mostly avoids padding the KV caches altogether. This adds a lot of complexity but means every batch only uses as much memory as it needs. This is a runtime optimization, so again it is indifferent to architecture.
+
+\begin{figure}[htb]
+\centering
+\includegraphics[width=\textwidth]{images/paged-attention.png}
+\caption{During generation, a single token (forth) attends to multiple KV cache blocks/pages. By paging the KV cache, we avoid loading or storing more memory than we need to.}
+\end{figure}
+
+\begin{takeawaybox}
+\textbf{Big Picture:} All told, these KV cache optimizations can reduce KV cache sizes by over an order of magnitude compared to a standard MHA Transformer. This can lead to an order-of-magnitude improvement in the overall cost of the Transformer.
+\end{takeawaybox}

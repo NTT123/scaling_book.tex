@@ -1,0 +1,268 @@
+\section*{Computation With Sharded Arrays}
+\addcontentsline{toc}{section}{Computation With Sharded Arrays}
+
+If you have an array of data that's distributed across many devices and wish to perform mathematical operations on it, what are the overheads associated with sharding both the data and the computation?
+
+Obviously, this depends on the computation involved.
+
+\begin{itemize}
+\item For \emph{elementwise} operations, there is \textbf{no overhead} for operating on a distributed array.
+\item When we wish to perform operations across elements resident on many devices, things get complicated. Thankfully, for most machine learning nearly all computation takes place in the form of matrix multiplications, and they are relatively simple to analyze.
+\end{itemize}
+
+The rest of this section will deal with how to multiply sharded matrices. To a first approximation, this involves moving chunks of a matrix around so you can fully multiply or sum each chunk. \textbf{Each sharding will involve different communication.} For example, $A[I_X, J] \cdot B[J, K_Y] \to C[I_X, K_Y]$ can be multiplied without any communication because the \emph{contracting dimension} (J, the one we're actually summing over) is unsharded. However, if we wanted the output unsharded (i.e. $A[I_X, J] \cdot B[J, K_Y] \to C[I, K]$), we would need to copy $A$ or $C$ to every device (using an \emph{AllGather}). These two choices have different communication costs, so we need to calculate this cost and pick the lowest one.
+
+\paragraph{You can think of this in terms of ``block matrix multiplication''.}
+
+To understand this, it can be helpful to recall the concept of a ``block matrix'', or a nested matrix of matrices:
+
+\begin{equation}
+\small
+\begin{pmatrix}
+a_{00} & a_{01} & a_{02} & a_{03} \\
+a_{10} & a_{11} & a_{12} & a_{13} \\
+a_{20} & a_{21} & a_{22} & a_{23} \\
+a_{30} & a_{31} & a_{32} & a_{33}
+\end{pmatrix}
+=
+\left(
+\begin{matrix}
+\begin{bmatrix}
+a_{00} & a_{01} \\
+a_{10} & a_{11}
+\end{bmatrix} \\
+\begin{bmatrix}
+a_{20} & a_{21} \\
+a_{30} & a_{31}
+\end{bmatrix}
+\end{matrix}
+\begin{matrix}
+\begin{bmatrix}
+a_{02} & a_{03} \\
+a_{12} & a_{13}
+\end{bmatrix} \\
+\begin{bmatrix}
+a_{22} & a_{23} \\
+a_{32} & a_{33}
+\end{bmatrix}
+\end{matrix}
+\right)
+=
+\begin{pmatrix}
+\mathbf{A_{00}} & \mathbf{A_{01}} \\
+\mathbf{A_{10}} & \mathbf{A_{11}}
+\end{pmatrix}
+\end{equation}
+
+Matrix multiplication has the nice property that when the matrix multiplicands are written in terms of blocks, the product can be written in terms of block matmuls following the standard rule:
+
+\begin{align}
+\small
+\begin{pmatrix}
+A_{00} & A_{01} \\
+A_{10} & A_{11}
+\end{pmatrix}
+&\cdot
+\begin{pmatrix}
+B_{00} & B_{01} \\
+B_{10} & B_{11}
+\end{pmatrix} \nonumber \\
+&=
+\begin{pmatrix}
+A_{00}B_{00} + A_{01}B_{10} & A_{00}B_{01} + A_{01}B_{11} \\
+A_{10}B_{00} + A_{11}B_{10} & A_{10}B_{01} + A_{11}B_{11}
+\end{pmatrix}
+\end{align}
+
+What this means is that implementing distributed matrix multiplications reduces down to moving these sharded blocks over the network, performing \emph{local} matrix multiplications on the blocks, and summing their results. \textbf{The question then is what communication to add, and how expensive it is.}
+
+Conveniently, we can boil down all possible shardings into roughly 4 cases we need to consider, each of which has a rule for what communication we need to add
+\begin{enumerate}
+\item \textbf{Case 1:} neither input is sharded along the contracting dimension. \emph{We can multiply local shards without any communication.}
+\item \textbf{Case 2:} one input has a sharded contracting dimension. \emph{We typically ``AllGather'' the sharded input along the contracting dimension.}
+\item \textbf{Case 3:} both inputs are sharded along the contracting dimension. \emph{We can multiply the local shards, then ``AllReduce'' the result.}
+\item \textbf{Case 4:} both inputs have a non-contracting dimension sharded along the same axis. We cannot proceed without AllGathering one of the two inputs first.
+\end{enumerate}
+
+You can think of these as rules that simply need to be followed, but it's also valuable to understand why these rules hold and how expensive they are. We'll go through each one of these in detail now.
+
+\subsection*{Case 1: neither multiplicand has a sharded contracting dimension}
+\addcontentsline{toc}{subsection}{Case 1: neither multiplicand has a sharded contracting dimension}
+
+\textbf{Lemma:} when multiplying sharded matrices, the computation is valid and the output follows the sharding of the inputs \emph{unless} the contracting dimension is sharded or both matrices are sharded along the same axis. For example, this works fine
+
+\begin{equation*}
+\mathbf{A}[I_X, J] \cdot \mathbf{B}[J, K_Y] \rightarrow \mathbf{C}[I_X, K_Y]
+\end{equation*}
+
+with no communication whatsoever, and results in a tensor sharded across both the X and Y hardware dimensions. Try to think about why this is. Basically, the computation is \emph{independent} of the sharding, since each batch entry has some local chunk of the axis being contracted that it can multiply and reduce. Any of these cases work fine and follow this rule:
+
+\begin{align*}
+\mathbf{A}[I, J] \cdot \mathbf{B}[J, K] \rightarrow &\ \mathbf{C}[I, K] \\
+\mathbf{A}[I_X, J] \cdot \mathbf{B}[J, K] \rightarrow &\ \mathbf{C}[I_X, K]\\
+\mathbf{A}[I, J] \cdot \mathbf{B}[J, K_Y] \rightarrow &\ \mathbf{C}[I, K_Y]\\
+\mathbf{A}[I_X, J] \cdot \mathbf{B}[J, K_Y] \rightarrow &\ \mathbf{C}[I_X, K_Y]
+\end{align*}
+
+Because neither \textbf{A} nor \textbf{B} has a sharded contracting dimension \textbf{J}, we can simply perform the local block matrix multiplies of the inputs and the results will \emph{already} be sharded according to the desired output shardings. When both multiplicands have non-contracting dimensions sharded along the same axis, this is no longer true (see the invalid shardings section for details).
+
+\subsection*{Case 2: one multiplicand has a sharded contracting dimension}
+\addcontentsline{toc}{subsection}{Case 2: one multiplicand has a sharded contracting dimension}
+
+Let's consider what to do when one input \textbf{A} is sharded along the contracting \textbf{J} dimension and \textbf{B} is fully replicated:
+
+$$\mathbf{A}[I, J_X] \cdot \mathbf{B}[J, K] \rightarrow \mathbf{C}[I, K]$$
+
+We cannot simply multiply the local chunks of \textbf{A} and \textbf{B} because we need to sum over the full contracting dimension of \textbf{A}, which is split across the X axis. Typically, we first ``\textbf{AllGather}'' the shards of \textbf{A} so every device has a full copy, and only then multiply against \textbf{B:}
+
+$$\textbf{AllGather}_X[I, J_X] \rightarrow \mathbf{A}[I, J]$$
+
+$$\mathbf{A}[I, J] \cdot \mathbf{B}[J, K] \rightarrow \mathbf{C}[I, K]$$
+
+This way the actual multiplication can be done fully on each device.
+
+\begin{takeawaybox}
+When multiplying matrices where one of the matrices is sharded along the contracting dimension, we generally AllGather it first so the contraction is no longer sharded, then do a local matmul.
+\end{takeawaybox}
+
+Note that when \textbf{B} is not also sharded along X, we could also do the local partial matmul and then sum (or \emph{AllReduce}) the sharded partial sums, which can be faster in some cases. See Question 4 below.
+
+\textbf{What is an AllGather?} An AllGather is the first core MPI communication primitive we will discuss. An AllGather \emph{removes the sharding} along an axis and reassembles the shards spread across devices onto \emph{each} device along that axis. Using the notation above, an AllGather removes a subscript from a set of axes, e.g.
+
+$$\textbf{AllGather}_{XY}(A[I_{XY}, J]) \rightarrow A[I, J]$$
+
+We don't have to remove all subscripts for a given dimension, e.g. $A[I_{XY}, J] \rightarrow A[I_Y, J]$ is also an AllGather, just over only a single axis. Also note that we may also wish to use an AllGather to remove \emph{non-contracting} dimension sharding, for instance in the matrix multiply:
+
+$$A[I_X, J] \cdot B[J, K] \rightarrow C[I, K]$$
+
+We could either AllGather \textbf{A} initially to remove the input sharding, or we can do the sharded matmul and then AllGather the result \textbf{C}.
+
+\textbf{How is an AllGather actually performed?} To perform a 1-dimensional AllGather around a single TPU axis (a ring), we basically have each TPU pass its shard around a ring until every device has a copy.\footnote{A GPU AllGather can also work like this, where you create a ring out of the GPUs in a node and pass the chunks around in that (arbitrary) order.}
+
+We can either do an AllGather in one direction or both directions (two directions is shown above). If we do one direction, each TPU sends chunks of size $\text{bytes} / N$ over $N - 1$ hops around the ring. If we do two directions, we have $\lfloor \frac{N}{2} \rfloor$ hops of size $2 \cdot \text{bytes} / N$.
+
+\textbf{How long does this take?} Let's take the bidirectional AllGather and calculate how long it takes. Let $V$ be the number of bytes in the array, and $X$ be the number of shards on the contracting dimension. Then from the above diagram, each hop sends $V / \lvert X\rvert$ bytes in each direction, so each hop takes
+
+$$T_{hop} = \frac{2 \cdot V}{X \cdot W_\text{ici}}$$
+
+where $W_\text{ici}$ is the \textbf{bidirectional} ICI bandwidth.\footnote{The factor of 2 in the numerator comes from the fact that we're using the bidirectional bandwidth. We send $V / X$ in each direction, or $2V / X$ total.} We need to send a total of $\lvert X\rvert / 2$ hops to reach every TPU\footnote{technically, $\lfloor X / 2 \rfloor$}, so the total reduction takes
+
+$$T_{total} = \frac{2 \cdot V \cdot X}{2 \cdot X \cdot W_\text{ici}}$$
+
+$$T_{total} = \frac{V}{W_\text{ici}}$$
+
+Note that this \textbf{doesn't depend on $X$!} That's kind of striking, because it means even though our TPUs are only locally connected, the locality of the connections doesn't matter. We're just bottlenecked by the speed of each link.
+
+\begin{takeawaybox}
+When performing an AllGather (or a ReduceScatter or AllReduce) in a throughput-bound regime, the actual communication time depends only on the size of the array and the available bandwidth, not the number of devices over which our array is sharded!
+\end{takeawaybox}
+
+\textbf{A note on ICI latency:} Each hop over an ICI link has some intrinsic overhead regardless of the data volume. This is typically around 1us. This means when our array $A$ is very small and each hop takes less than 1us, we can enter a ``latency-bound'' regime where the calculation \emph{does} depend on $X$.
+
+Let $T_\text{min}$ be the minimum time for a single hop. Then
+
+$$T_{hop} = \max \left[ T_{min}, \frac{2 \cdot V}{X \cdot W_\text{ici}} \right]$$
+
+$$T_{total} = \max \left[ \frac{T_{min} \cdot X}{2}, \frac{V}{W_\text{ici}} \right]$$
+
+since we perform $X / 2$ hops. For large reductions or gathers, we're solidly bandwidth bound. We're sending so much data that the overhead of each hop is essentially negligible. But for small arrays (e.g. when sampling from a model), this isn't negligible, and the ICI bandwidth isn't relevant. We're bound purely by latency. Another way to put this is that given a particular TPU, e.g. TPU v5e with \texttt{4.5e10} unidirectional ICI bandwidth, sending any buffer under \texttt{4.5e10 * 1e-6 = 45kB} will be latency bound.
+
+Here is an empirical measurement of AllGather bandwidth on a TPU v5e 8x16 slice. The array is sharded across the 16 axis so it has a full bidirectional ring.
+
+\begin{figure}[htb]
+\centering
+\includegraphics[width=\textwidth]{images/all-gather-bandwidth.png}
+\caption{Empirical bandwidth and estimated link bandwidth for TPU v5e during an AllGather. BW in orange is the actual bytes per second AllGathered, while the blue curve shows the empirical unidirectional link bandwidth calculated according to the known cost of the collective.}
+\end{figure}
+
+Note that we not only achieve about 95\% of the peak claimed bandwidth (\texttt{4.5e10}) but also that we achieve this peak at about 10MB, which when 16-way sharded gives us about 500kB per device (\emph{aside}: this is much better than GPUs).
+
+\textbf{What happens when we AllGather over multiple axes?} When we gather over multiple axes, we have multiple dimensions of ICI over which to perform the gather. For instance, AllGather\textsubscript{XY}([B, D\textsubscript{XY}]) operates over two hardware mesh axes. This increases the available bandwidth by a factor of $N_\text{axes}$.
+
+When considering latency, we end up with the general rule:
+
+$$T_{total} = \max \left[ \frac{T_{min} \cdot \sum_{i} |X_i|}{2}, \frac{V}{W_\text{ici} \cdot N_\text{axes}} \right]$$
+
+where $\sum_i \lvert X_i \rvert / 2$ is the length of the longest path in the TPU mesh.
+
+\textbf{\textcolor{purple}{Pop Quiz 2 [AllGather time]:}} Using the numbers from Part 2, how long does it take to perform the AllGather\textsubscript{Y}([E\textsubscript{Y}, F]) → [E, F] on a TPUv5e with a 2D mesh \texttt{\{'X': 8, 'Y': 4\}}, $E = 2048$, $F = 8192$ in bfloat16? What about with $E=256, F=256$?
+
+\emph{For part (1)}, we can use the formula above. Since we're performing the AllGather over one axis, we have $T_{\text{comms}} = \text{34e6} / \text{9e10} = \text{377us}$. To check that we're not latency-bound, we know over an axis of size 4, we'll have at most 3 hops, so our latency bound is something like 3us, so we're not close. However, TPU v5e only has a wraparound connection when one axis has size 16, so here \emph{we actually can't do a fully bidirectional AllGather}. We have to do 3 hops for data from the edges to reach the other edge, so in theory we have more like $T_{\text{comms}} = 3 * \text{8.4e6} / \text{4.5e10} = 560\mu s$. \textbf{Here's an actual profile} from this Colab, which shows $680 \mu s$, which is reasonable since we're likely not getting 100\% of the theoretical bandwidth! \emph{For part (2)} each shard has size \texttt{64 * 256 * 2 = 32kB. 32e3 / 4.5e10 = 0.7us}, so we're latency bound. Since we have 3 hops, this will take roughly 3 * 1us = 3us. In practice, it's closer to 8us.
+
+\begin{takeawaybox}
+\textbf{Note:} when we have a 2D mesh like \texttt{\{'X': 16, 'Y': 4\}}, it is not necessary for each axis to correspond to a specific \emph{hardware} axis. This means for instance the above could describe a 4x4x4 TPU v5p cube with 2 axes on the $X$ axis. This will come into play later when we describe data parallelism over multiple axes.
+\end{takeawaybox}
+
+\subsection*{Case 3: both multiplicands have sharded contracting dimensions}
+\addcontentsline{toc}{subsection}{Case 3: both multiplicands have sharded contracting dimensions}
+
+The third fundamental case is when both multiplicands are sharded on their contracting dimensions, along the same mesh axis:
+
+$$\textbf{A}[I, J_X] \cdot \textbf{B}[J_X, K] \rightarrow C[I, K]$$
+
+In this case the \emph{local} sharded block matrix multiplies are at least \emph{possible} to perform, since they will share the same sets of contracting indices. But each product will only represent a \emph{partial sum} of the full desired product, and each device along the \textbf{X} dimension will be left with different \emph{partial sums} of this final desired product. This is so common that we extend our notation to explicitly mark this condition:
+
+$$\textbf{A}[I, J_X] \cdot_\text{LOCAL} \textbf{B}[J_X, K] \rightarrow C[I, K] \{\ U_X \}$$
+
+The notation \textbf{\{ U\textsubscript{X} \}} reads ``\textbf{unreduced} along X mesh axis'' and refers to this status of the operation being ``incomplete'' in a sense, in that it will only be finished pending a final sum. The $\cdot_\text{LOCAL}$ syntax means we perform the local sum but leave the result unreduced.
+
+This can be seen as the following result about matrix multiplications and outer products:
+
+$$A \cdot B = \sum_{i=1}^{P} \underbrace{A_{:,i} \otimes B_{i,:}}_{\in \mathbb{R}^{n \times m}}$$
+
+where ⊗ is the outer product. Thus, if TPU \textbf{i} on axis \textbf{X} has the \textbf{i}th column of \textbf{A}, and the \textbf{i}th row of \textbf{B}, we can do a local matrix multiplication to obtain $A_{:,i} \otimes B_{i,:} \in \mathbb{R}_{n\times m}$. This matrix has, in each entry, the \textbf{i}th term of the sum that \textbf{A • B} has at that entry. We still need to perform that sum over \textbf{P}, which we sharded over mesh axis \textbf{X}, to obtain the full \textbf{A • B}. This works the same way if we write \textbf{A} and \textbf{B} by blocks (i.e. shards), and then sum over each resulting shard of the result.
+
+We can perform this summation using a full \textbf{AllReduce} across the \textbf{X} axis to remedy this:
+
+\begin{align*}
+A[I, J_X] \cdot_\text{LOCAL} B[J_X, K] \rightarrow &\ C[I, K] \{ U_X \} \\
+\textbf{AllReduce}_X C[I, K] \{ U_X \} \rightarrow &\ C[I, K]
+\end{align*}
+
+AllReduce removes partial sums, resulting in \emph{each} device along the axis having the same fully-summed value. AllReduce is the second of several key communications we'll discuss in this section, the first being the AllGather, and the others being ReduceScatter and AllToAll. An AllReduce takes an array with an unreduced (partially summed) axis and performs the sum by passing those shards around the unreduced axis and accumulating the result. The signature is
+
+$$\textbf{AllReduce}_Y A[I_X, J] \{U_Y\} \rightarrow A[I_X, J]$$
+
+This means it simply removes the $\{U_Y\}$ suffix but otherwise leaves the result unchanged.
+
+\textbf{How expensive is an AllReduce?} One mental model for how an AllReduce is performed is that every device sends its shard to its neighbors, and sums up all the shards that it receives. Clearly, this is more expensive than an AllGather because each ``shard'' has the same shape as the full array. Generally, \textbf{an AllReduce is twice as expensive as an AllGather.} One way to see this is to note that an \textbf{AllReduce} can be expressed as a composition of two other primitives: a \textbf{ReduceScatter} and an \textbf{AllGather}. Like an AllReduce, a ReduceScatter resolves partial sums on an array but results in an output `scattered' or partitioned along a given dimension. AllGather collects all those pieces and `unpartitions/unshards/replicates' the logical axis along that physical axis.
+
+\begin{align*}
+\textbf{ReduceScatter}_{Y,J} : A[I_X,J] \{U_Y\} \rightarrow &\ A[I_X, J_Y] \\
+\textbf{AllGather}_Y : A[I_X, J_Y] \rightarrow &\ A[I_X, J]
+\end{align*}
+
+\textbf{What about a ReduceScatter?} Just as the AllReduce removes a subscript ($F_Y \to F$ above), a ReduceScatter sums an unreduced/partially summed array and then scatters (shards) a different logical axis along the same mesh axis. $[F]\{U_Y\} \to [F_Y]$. 
+
+The communication time for each hop is simply the per-shard bytes $V / Y$ divided by the bandwidth $W_\text{ici}$, as it was for an AllGather, so we have
+
+$$T_{\text{comms per AllGather or ReduceScatter}} = \frac{V}{W_\text{ici}}$$
+
+$$T_{\text{comms per AllReduce}} = 2 \cdot \frac{V}{W_\text{ici}}$$
+
+where $W_\text{ici}$ is the bidirectional bandwidth, so long as we have a full ring to reduce over.
+
+\subsection*{Case 4: both multiplicands have a non-contracting dimension sharded along the same axis}
+\addcontentsline{toc}{subsection}{Case 4: both multiplicands have a non-contracting dimension sharded along the same axis}
+
+Each mesh dimension can appear at most once when sharding a tensor. Performing the above rules can sometimes lead to a situation where this rule is violated, such as:
+
+$$A[I_X, J] \cdot B[J, K_X] \rightarrow C[I_X, K_X]$$
+
+This is invalid because a given shard, say \textbf{i}, along dimension \textbf{X}, would have the \textbf{(i, i)}th shard of \textbf{C}, that is, a diagonal entry. There is not enough information among all shards, then, to recover anything but the diagonal entries of the result, so we cannot allow this sharding.
+
+The way to resolve this is to AllGather some of the dimensions. Here we have two choices:
+
+\begin{align*}
+\textbf{AllGather}_X A[I_X, J] \rightarrow &\ A[I, J] \\
+A[I, J] \cdot B[J, K_X] \rightarrow &\ C[I, K_X]
+\end{align*}
+
+or
+
+\begin{align*}
+\textbf{AllGather}_X B[J, K_X] \rightarrow &\ B[J, K] \\
+A[I_X, J] \cdot B[J, K] \rightarrow &\ C[I_X, K]
+\end{align*}
+
+In either case, the result will only mention \textbf{X} once in its shape. Which one we pick will be based on what sharding the following operations need.

@@ -1,0 +1,307 @@
+\section{The Basics of Transformer Inference}
+
+So you've trained a Transformer, and you want to use it to generate some new sequences. \textit{At the end of the day, benchmark scores going up and loss curves going down are only proxies for whether something interesting is going to happen once the rubber hits the road!}\footnote{Historically, you can do a surprising amount of research on Transformers without ever touching inference---LLM loss, multiple choice benchmarks can be run efficiently without a proper KV cache or generation loop implementation. This meant, especially in research codebases, there's often a lot of low hanging fruits in the inference codepath.}
+
+Sampling is conceptually simple. We put a sequence in and our favorite Transformer will spit out $\log p(\text{next token}_i \mid \text{previous tokens})$~, i.e. log-probabilities for all possible next tokens. We can sample from this distribution and obtain a new token. Append this token and repeat this process and we obtain a sequence of tokens which is a continuation of the prompt.
+
+\begin{figure}[htb]
+\centering
+\includegraphics[width=\textwidth]{images/naive-inference.png}
+\caption{naive sampling from a Transformer. The blue logits give us a distribution over the next token that we can sample from. Note that each step re-processes the entire prefix, leading to a $\Theta(n^2)$ runtime for the algorithm.}
+\end{figure}
+
+We have just described the naive implementation of Transformer sampling, and while it works, \textbf{we never do it in practice} because we are re-processing the entire sequence every time we generate a token. This algorithm is $O(n^2)$ on the FFW and $O(n^3)$ on the attention mechanism to generate $n$ tokens!
+
+\textbf{How do we avoid this?} Instead of doing the full forward pass every time, it turns out we can save some intermediate activations from each forward pass that let us avoid re-processing previous tokens. Specifically, since a given token only attends to previous tokens during dot-product attention, we can simply write each token's key and value projections into a new data structure called a \textbf{KV cache}. Once we've saved these key/value projections for past tokens, future tokens can simply compute their $q_i \cdot k_j$ products without performing any new FLOPs on the earlier tokens. Amazing!
+
+With this in mind, inference has two key parts:
+
+\begin{itemize}
+\item \textcolor{red}{\textbf{Prefill}}: Given a long prompt, we process all the tokens in the prompt at the same time and save the resulting activations (specifically, the key-value projections) in a \textbf{``KV cache''}. We also save the logits for the last token.
+\item \textcolor{blue}{\textbf{Generation}}: Given a KV cache and the previous logits, we incrementally sample one token from the logits, feed that token back into the Transformer, and produce a new set of logits for the next step. We also append the KV activations for that new token to the KV cache. We repeat this until we hit a special \texttt{<EOS>} token or reach some maximum length limit.
+\end{itemize}
+
+Here's a diagram of sampling with a KV cache:
+
+\begin{figure}[htb]
+\centering
+\includegraphics[width=\textwidth]{images/cached-inference.png}
+\caption{diagram of efficient Transformer sampling with a KV cache.}
+\end{figure}
+
+By sampling with a KV cache, we've reduced our time complexity to generate $n$ tokens to $O(n)$ on the FFW and $O(n^2)$ on the attention, since we never reprocess a previous token. However, many forward passes are still needed to generate a sequence---that's what's happening when you query Gemini or ChatGPT and the result streams back to you. Every token is (usually) a separate (but partially cached) Transformer call to a massive model.
+
+We will soon see that \textcolor{red}{\textbf{prefill}} and \textcolor{blue}{\textbf{generation}} are very different beasts---Transformer inference is two tasks in disguise! Compared to training, the KV cache is also a novel and significant source of complexity.
+
+\subsection{What do we actually want to optimize?}
+
+Before we proceed further, it's worth highlighting one aspect of inference that's totally new: latency. While during training we only care about throughput (total tokens processed per second \textbf{per chip}), during inference we have to worry about how fast we're producing tokens (both the \textbf{Time To First Token (TTFT)} and the \textbf{per-token latency}). For example:
+
+\begin{itemize}
+\item \textbf{Offline batch inference} for evals and data generation only cares about bulk cost of inference and is blind to the latency of individual samples.
+\item \textbf{Chat interfaces/streaming tasks} need to run cheaply at scale while having low TTFT and generating tokens fast enough to exceed human reading speed.
+\item \textbf{Edge inference} (e.g. \texttt{llama.cpp} on your laptop) only needs to service one user at a time at the lowest possible latency, potentially with heavy hardware constraints.
+\end{itemize}
+
+Maximizing hardware utilization is still critical and helps with cost and TTFT, but unlike training, it does not \textit{necessarily} translate to better experience for individual users in all contexts. Many optimizations at the accelerator, systems and model architectural level make tradeoffs between latency, throughput, context length and even model quality.
+
+\subsection{A more granular view of the Transformer}
+
+So far we've mostly treated a Transformer as a stack of feedforward blocks. While this is often reasonable from a FLOPs and memory standpoint, it's not sufficient to properly model inference.\footnote{One thing you'll notice throughout this section is that inference is much less forgiving than training. We typically have far fewer FLOPs, less opportunity for batching, and a much greater sensitivity to latency. KV caches dramatically complicate inference as well.} As we saw in [Part 4](../transformers), the major components of a Transformer forward pass are:
+
+\begin{enumerate}
+\item \textbf{A bunch of linear operations}, including the MLP ($W_{in}$, $W_{out}$) and the attention QKV projections and output projections ($W_Q$, $W_K$, $W_V$, and $W_O$). These all involve reading parameters and a batch of activations from HBM, doing some FLOPs, and writing the result back to HBM.
+\item \textbf{Dot-product attention}. We need to read a batch of key-value projections and a batch of query activations from HBM, do a few inner products and some softmax operations, and write the attention result back to HBM.
+\item \textbf{Everything else}, including applying layer norms, activation functions, tokens sampling, updating KV caches, and positional embeddings. These do take some FLOPs, but are dominated by, or fused into, the above.
+\end{enumerate}
+
+For the next couple of sections, we're going to look at each of these in the context of prefill and generation and ask what is likely to bottleneck our performance. Within a single accelerator, are we compute-bound or memory-bound? We want to emphasize how different the answers will be for prefill versus generation.
+
+\subsection{Linear operations: what bottlenecks us?}
+
+All our linear operations are conceptually the same, whether they live in the MLP block or attention. Their arithmetic intensity depends on the batch size. We did this math in [Section 1](../roofline) but it's worth repeating. Let's look at a single matrix multiply of a $\text{bf16[B, D]}$ batch by a $\text{bf16[D, F]}$ matrix. This could be the big MLP block ($W_\text{in}$ or $W_\text{out}$) or one of the smaller attention projections ($W_Q$, $W_K$, $W_V$, $W_O$). To do this matmul, we need to load both of these arrays from HBM into the MXU, do the multiplicaton, then write the result back to HBM. As before, we have:
+
+\begin{align*}
+T_\text{math} &= \frac{\text{Computation FLOPs}}{\text{Accelerator FLOPs/s}} = \frac{2BDF}{\text{Accelerator FLOPs/s}} \\
+T_\text{comms} &= \frac{\text{Communication Bytes}}{\text{Bandwidth Bytes/s}} = \frac{2BD + 2FD + 2BF}{\text{Bandwidth Bytes/s}}
+\end{align*}
+
+A TPU or GPU can overlap these by loading as it does the compute, so to be compute-bound, we need $T_\text{math} \geq T_\text{comms}$~, or:
+
+$$\frac{2BDF}{2BD + 2DF + 2BF} \geq \frac{\text{Accelerator FLOPs/s}}{\text{Bandwidth Bytes/s}} \underset{\text{TPU v5e}}{=} \frac{1.97E+14}{8.20E+11} = 240$$
+
+where the RHS is the arithmetic intensity of our hardware. Now let's assume $D$ and $F$ are very large compared to $B$ (usually our batches are at most 500 and $D$ and $F > 10k$), we can simplify the denominator by using the fact that $\small{2BD + 2DF + 2BF \approxeq 2DF}$ which gives us
+
+\begin{align*}
+\frac{2BDF}{2BD + 2DF + 2BF} &\approxeq \frac{2BDF}{2DF} \geq \frac{\text{Accelerator FLOPs/s}}{\text{Bandwidth Bytes/s}} \\
+&\underset{\text{TPU v5e}}{=} \frac{1.97E+14}{8.20E+11} \implies B \geq 240 = B_{\text{crit}}
+\end{align*}
+
+If we quantize our weights or use lower precision FLOPs for the matrix multiplication, this critical batch size can change. For instance, if we quantize our weights to int8 or fp8, $B_\text{crit}$ decreases by 2x. If we do our FLOPs in int8 or fp8, $B_\text{crit}$ increases by 2x. Thus if we let $\beta = \text{bits per param} / \text{bits per activation}$ and $\alpha_\text{hbm} = C / W_\text{hbm}$~, our critical batch size is actually $B_\text{crit} = \beta \alpha_\text{hbm}$~.
+
+\begin{takeawaybox}
+Transformer matmuls are compute-bound \textit{iff} the per-replica \textbf{token} batch size is greater than $B_\text{crit} = C / W_\text{hbm} \cdot (\text{bits per param} / \text{bits per activation}) = \beta \cdot \alpha_\text{hbm}$ For bf16 activations on TPU v5e, this is 240 tokens. For an H100, it is about 280 tokens.
+\end{takeawaybox}
+
+During training, we'll have a high intensity during all our matrix multiplications because we reuse the same weights over a very large batch. \textbf{That high arithmetic intensity carries over to prefill, since user prompts are typically hundreds if not thousands of tokens long.} As we saw before, the hardware arithmetic intensity of a TPUv5e is 240, so if a sequence longer than 240 tokens is fed into a dense model running on this hardware at bf16, we would expect to be compute-bound and all is well. Prompts shorter than this can technically be batched together to achieve higher utilization, but this is typically not necessary.
+
+\begin{takeawaybox}
+During prefill, all matrix multiplications are basically always compute-bound. Therefore, simply maximizing hardware utilization or MFU (Model FLOPs Utilization) is enough to maximize throughput-per-chip (cost) and latency (in the form of TTFT). Unless prompts are extremely short, batching at a per-prompt level only adds latency for a small improvements in prefill throughput.
+\end{takeawaybox}
+
+However, during generation, for each request, we can only do our forward passes one token at a time since there's a sequential dependency between steps! Thus we can only (easily) achieve good utilization by batching multiple requests together, parallelizing over the batch dimension. We'll talk about this more later, but actually batching many concurrent requests together without affecting latency is hard. For that reason, \textbf{it is much harder to saturate the hardware FLOPs with generation.}
+
+\begin{takeawaybox}
+During generation, the total token batch size must be greater than $B_{\text{crit}}$ to be compute-bound on the linear/feed-forward operations (240 for bf16 params on TPU v5e). Because generation happens serially, token-by-token, this requires us to batch multiple requests together, which is hard!
+\end{takeawaybox}
+
+\textit{It's worth noting just how large this is!} Generate batch size of 240 means 240 concurrent requests generating at once, and 240 separate KV caches for dense models. That means this is difficult to achieve in practice, except in some bulk inference settings. In contrast, pushing more than 240 tokens through during a prefill is pretty routine, though some care is necessary as sparsity increases.
+
+\textbf{Note that this exact number will differ on the kind of quantization and hardware.} Accelerators often can supply more arithmetic in lower precision. For example, if we have int8 parameters but do our computation in bf16, the critical batch size drops to 120. With int8 activations and int8 params, it jumps back up to 240 since the TPUv5e can supply 400 TOPs/s of int8 x int8.
+
+\subsection{What about attention?}
+
+Things get more complicated when we look at the dot-product attention operation, especially since we have to account for KV caches. Let's look at just one attention head with pure multi-headed attention. In a single Flash Attention fusion, we\footnote{We're simplifying a fair bit here by ignoring the non-matmul FLOPs in applying the softmax, masks etc. They should be overlapped with computation or HBM reads, but it can be non-trivial to do on certain TPU generations. Whese details don't change the main message, which is that KV caches are usually memory bound.}:
+
+\begin{enumerate}
+\item Read the $Q$ activations of shape $\text{bf16[B, T, D]}$ from HBM.
+\item Read the $KV$ cache, which is a pair of $\text{bf16[B, S, D]}$ tensors from HBM.
+\item Perform $2BSTD$ FLOPs in the $QK$ matmul. With Flash Attention, we don't need to write the $\text{bf16[B, S, T]}$ attention matrix back into HBM.
+\item Perform $2BSTD$ in the attention $AV$ matmul.
+\item Write the resulting $\text{bf16[B, T, D]}$ tensor back into HBM.
+\end{enumerate}
+
+Putting it all together, we get:
+
+\begin{align*}
+\text{Multiheaded Attention} & \\
+\text{Arithmetic Intensity} &= \frac{4BSTD}{4BSD + 4BTD} = \frac{ST}{S+T}
+\end{align*}
+
+For prefill, $S=T$ since we're doing self-attention, so this simplifies to $T^2 / 2T = T / 2$ This is great because it means \textbf{the arithmetic intensity of attention during prefill is $\Theta(T)$}~. That means it's quite easy to be compute-bound for attention. As long as our sequence length is fairly large, we'll be fine!
+
+But since generation has a trivial sequence dim, and the $B$ and $D$ dims cancel, we can make the approximation:
+
+$$S \gg T = 1 \implies \frac{ST}{S+T} \approx 1$$
+
+This is bad, since it means we cannot do anything to improve the arithmetic intensity of attention during generation. We're doing a tiny amount of FLOPs while loading a massive KV cache. \textbf{So we're basically always memory bandwidth-bound during attention!}
+
+\begin{takeawaybox}
+during prefill, attention is usually compute bound for any reasonable sequence length (roughly $> 480$ tokens) while during generation our arithmetic intensity is low and constant, so we are always memory bandwidth-bound.
+\end{takeawaybox}
+
+\textit{Why is this, conceptually?} Mainly, we're compute-bound in linear portions of the model because the parameters (the memory bandwidth-heavy components) are reused for many batch items. However, every batch item has its own KV cache, so a bigger batch size means more KV caches. We will almost \textit{always} be memory bound here unless the architecture is adjusted aggressively.
+
+This also means you will get diminishing returns on throughput from increasing batch size once params memory becomes comparable to KV cache memory. The degree to which the diminishing returns hurt you depends on the ratio of parameter to KV cache bytes for a single sequence, i.e. roughly the ratio $2DF / SHK$ Since $HK\approx D$~, this roughly depends on the ratio of $F$ to $S$~, the sequence length. This also depends on architectural modifications that make the KV cache smaller (we'll say more in a moment).
+
+\subsection{Theoretical estimates for LLM latency and throughput}
+
+From this math, we can get pretty good bounds on the step time we should aim for when optimizing. \textbf{(Note: if there is one thing we want to the reader to take away from this entire chapter, it's the following).} For small batch sizes during generation (which is common), we can lower-bound our per-step latency by assuming we're memory bandwidth bound in both the attention and MLP blocks:
+
+\begin{equation*}
+\small
+\text{Theoretical Min Step Time} = \frac{\text{Batch Size} \times \text{KV Cache Size} + \text{Parameter Size}}{\text{Total Memory Bandwidth}}
+\end{equation*}
+
+Similarly, for throughput:
+
+\begin{equation*}
+\small
+\text{Theoretical Max Tokens/s} = \frac{\text{Batch Size} \times \text{Total Memory Bandwidth}}{\text{Batch Size} \times \text{KV Cache Size} + \text{Parameter Size}}
+\end{equation*}
+
+Eventually, as our batch size grows, FLOPs begin to dominate parameter loading, so in practice we have the more general equation:
+
+\begin{align*}
+\small
+&\text{\small Theoretical Step Time (General)} = \underbrace{\frac{\text{\small Batch Size} \times \text{KV Cache Size}}{\text{Total Memory Bandwidth}}}_{\text{\small Attention (always bandwidth-bound)}} \\
+& + \underbrace{\max\left(\frac{2 \times \text{\tiny Batch Size} \times \text{\tiny Parameter Count}}{\text{\tiny Total FLOPs/s}}, \frac{\text{\tiny Parameter Size}}{\text{\tiny Total Memory Bandwidth}}\right)}_{\text{\tiny MLP (can be compute-bound)}}
+\end{align*}
+
+where the attention component (left) is never compute-bound, and thus doesn't need a FLOPs roofline. These are fairly useful for back-of-the-envelope calculations, e.g.
+
+\textbf{\textcolor[rgb]{0.34,0.81,0.34}{Pop Quiz:}} Assume we want to take a generate step with a batch size of 4 tokens from a 30B parameter dense model on TPU v5e 4x4 slice in int8 with bf16 FLOPs, 8192 context and 100 kB / token KV caches. What is a reasonable lower bound on the latency of this operation? What if we wanted to sample a batch of 256 tokens?
+
+As you can see, there's a clear tradeoff between throughput and latency here. Small batches are fast but don't utilize the hardware well. Big batches are slow but efficient. Here's the latency-throughput Pareto frontier calculated for some older PaLM models (from the \href{https://arxiv.org/pdf/2211.05102}{ESTI paper}~\cite{esti}):
+
+\begin{figure}[htb]
+\centering
+\includegraphics[width=\textwidth]{images/latency-cost.png}
+\caption{Pareto frontier of cost (read: throughput) versus latency for several PaLM models. Note how chip count (C) and batch size (B) moves you along the Pareto frontier, with the exception of the green dot (C:32 B:16 for PaLM 540B) where the available memory prevented the setup from supporting a good batch size and caused throughput to suffer. Note how throughput generally tends to flatten around after the batch size 240. int8 weights offers a better latency-throughput pareto optimal, but not a better max throughput.}
+\end{figure}
+
+Not only do we trade off latency and throughput with batch size as knob, we may also prefer a larger topology to a smaller one so we can fit larger batches if we find ourselves limited by HBM. The [next section](../applied-inference) explores this in more detail.
+
+\begin{takeawaybox}
+if you care about generation throughput, use the largest per-chip batch size possible. Any per-chip batch size above the TPU arithmetic intensity ($B_\text{crit}$~, usually 120 or 240) will maximize throughput. You may need to increase your topology to achieve this. Smaller batch sizes will allow you to improve latency at the cost of throughput.
+\end{takeawaybox}
+
+This is all quite theoretical. In practice we often don't quite see a sharp roofline for a few reasons:
+
+\begin{itemize}
+\item Our assumption that HBM reads will be perfectly overlapped with FLOPs is not realistic, since our compiler (XLA) is fallible.
+\item For sharded models, XLA also often fails to efficiently overlap the ICI communication of our model-sharded matrix multiples with the FLOPs themselves, so we often start taking a latency hit on linears over $\text{BS}=32$~.
+\item Batch sizes larger than the theoretical roofline will still see some improvement in throughput because of imperfect overlapping, but this is a good heuristic.
+\end{itemize}
+
+\subsection{What about memory?}
+
+We've spent some time looking at bandwidth and FLOPs, but not at memory. The memory picture looks a lot different at inference time, thanks to our new data structure, the KV cache. For this section, let's pick a real model (LLaMA 2-13B) to demonstrate how different things look:
+
+\begin{table}[htb]
+\centering
+{\scriptsize
+\setlength{\tabcolsep}{2pt}
+\begin{longtable}{p{5cm}p{2cm}}
+\toprule
+\textbf{hyperparam} & \textbf{value} \\
+\midrule
+L (num\_layers) & 40 \\
+\addlinespace
+D (d\_model) & 5,120 \\
+\addlinespace
+F (ffw\_dimension) & 13,824 \\
+\addlinespace
+N (num\_heads) & 40 \\
+\addlinespace
+K (num\_kv\_heads) & 40 \\
+\addlinespace
+H (qkv\_dim) & 128 \\
+\addlinespace
+V (num\_embeddings) & 32,000 \\
+\bottomrule
+\end{longtable}
+}
+\end{table}
+
+What's using memory during inference? Well, obviously, our parameters. Counting those, we have:
+
+\begin{table}[hbt]
+\centering
+{\scriptsize
+\setlength{\tabcolsep}{1.5pt}
+\begin{longtable}{p{2cm}p{4.5cm}p{2.5cm}}
+\toprule
+\textbf{param} & \textbf{formula} & \textbf{size (bytes)} \\
+\midrule
+FFW params & d\_model\textsuperscript{2} x ffw\_mult. x 3 (gelu + out-proj) x n\_layers & 5,120 x 5,120 x 2.7 x 3 x 40 = \textbf{8.5e9} \\
+\addlinespace
+Vocab params & 2 (in \& out emb.) x n\_emb. x d\_model & 2 x 32,000 x 5,120 = \textbf{0.3e9} \\
+\addlinespace
+Attn params & [2 (q \& out) x d\_model x n\_heads x d\_qkv + 2 (k \& v) x d\_model x n\_kv\_heads x d\_qkv] x n\_layers & (2 x 5,120 x 40 x 128 + 2 x 5,120 x 40 x 128) x 40 = \textbf{4.2e9} \\
+\bottomrule
+\end{longtable}
+}
+\end{table}
+
+Adding these parameters up, we get 8.5e9 + 4.2e9 + 0.3e9 = \textbf{13e9 total parameters}, just as expected. As we saw in the previous sections, during training we might store our parameters in bfloat16 with an optimizer state in float32. That may use around 100GB of memory. That pales in comparison to our gradient checkpoints, which can use several TBs.
+
+\textbf{How is inference different?} During inference, we store one copy of our parameters, let's say in bfloat16. That uses 26GB---and in practice we can often do much better than this with quantization. There's no optimizer state or gradients to keep track of. Because we don't checkpoint (keep activations around for the backwards pass), our activation footprint is negligible for both prefill\footnote{Particularly thanks to Flash Attention, which avoids materializing our attention matrix} and generate. If we prefill 8k tokens, a single activation only uses around \texttt{8,192 x 5,120 x 2 bytes = 80MB} of memory. Longer prefills can be broken down into many smaller forward passes, so it's not a problem for longer contexts either. Generation use even fewer tokens than that, so activations are negligible.
+
+\textbf{The main difference is the KV cache}. These are the keys and value projections for all past tokens, bounded in size only by the maximum allowed sequence length. The total size for $T$ tokens is
+
+$$\text{KV cache size} = 2 \cdot \text{bytes per float} \cdot H \cdot K \cdot L \cdot T$$
+
+where $H$ is the dimension of each head, $K$ is the number of KV heads, $L$ is the number of layers, and the 2 comes from storing both the keys and values.
+
+\textbf{This can get big very quickly}, even with modest batch size and context lengths. For LLaMA-13B, a KV cache for a single 8192 sequence at bf16 is
+
+$$8192\ (T) \times 40\ (K) \times 128\ (H) \times 40\ (L) \times 2\ (\text{bytes}) \times 2 = 6.7 \text{GB}$$
+
+\textbf{Just 4 of these exceed the memory usage of our parameters!} To be clear, LLaMA 2 was not optimized for KV cache size at longer contexts (it isn't always this bad, since usually $K$ is much smaller, as in LLaMA-3), but this is still illustrative. We cannot neglect these in memory or latency estimates.
+
+\subsection{Modeling throughput and latency for LLaMA 2-13B}
+
+Let's see what happens if we try to perform generation perfectly efficiently at different batch sizes on 8xTPU v5es, up to the critical batch size (240) derived earlier for maximum theoretical throughput.
+
+\begin{table}[htb]
+\centering
+{\scriptsize
+\setlength{\tabcolsep}{1.5pt}
+\begin{longtable}{p{3cm}p{0.9cm}p{0.9cm}p{0.9cm}p{0.9cm}p{0.9cm}p{1cm}}
+\toprule
+\textbf{Batch Size} & \textbf{1} & \textbf{8} & \textbf{16} & \textbf{32} & \textbf{64} & \textbf{240} \\
+\midrule
+KV Cache Memory (GiB) & 6.7 & 53.6 & 107.2 & 214.4 & 428.8 & 1608 \\
+\addlinespace
+Total Memory (GiB) & 32.7 & 79.6 & 133.2 & 240.4 & 454.8 & 1634 \\
+\addlinespace
+Step Time (ms) & 4.98 & 12.13 & 20.30 & 36.65 & 69.33 & 249.09 \\
+\addlinespace
+Throughput (tok/s) & 200.61 & 659.30 & 787.99 & 873.21 & 923.13 & 963.53 \\
+\bottomrule
+\end{longtable}
+}
+\end{table}
+
+8x TPU v5es gives us 128GiB of HBM, 6.5TiB/s of HBM bandwidth (0.82TiB/s each) and 1600TF/s of compute.
+
+For this model, increasing the batch size does give us better throughput, but we suffer rapidly diminishing returns. We OOM beyond batch size 16, and need an order of magnitude more memory to go near 240. A bigger topology can improve the latency, but we've hit a wall on the per chip throughput.
+
+Let's say we keep the total number of params the same, but magically make the KV cache 5x smaller (say, with 1:5 [GMQA](\#tricks-for-improving-generation-throughput-and-latency), which means we have 8 KV heads shared over the 40 Q heads---see next section for more details).
+
+\begin{table}[htb]
+\centering
+{\scriptsize
+\setlength{\tabcolsep}{1.5pt}
+\begin{longtable}{p{3cm}p{0.9cm}p{0.9cm}p{0.9cm}p{0.9cm}p{0.9cm}p{1cm}}
+\toprule
+\textbf{Batch Size} & \textbf{1} & \textbf{8} & \textbf{16} & \textbf{32} & \textbf{64} & \textbf{240} \\
+\midrule
+KV Cache Memory (GiB) & 1.34 & 10.72 & 21.44 & 42.88 & 85.76 & 321.6 \\
+\addlinespace
+Total Memory (GiB) & 27.34 & 36.72 & 47.44 & 68.88 & 111.76 & 347.6 \\
+\addlinespace
+Step Time (ms) & 4.17 & 5.60 & 7.23 & 10.50 & 17.04 & 52.99 \\
+\addlinespace
+Throughput (tok/s) & 239.94 & 1,429.19 & 2,212.48 & 3,047.62 & 3,756.62 & 4,529.34 \\
+\bottomrule
+\end{longtable}
+}
+\end{table}
+
+With a smaller KV cache, we still have diminishing returns, but the theoretical throughput per chip continues to scale up to batch size 240. We can fit a much bigger batch of 64, and latency is also consistently better at all batch sizes. The latency, maximum throughput, and maximum batch size all improve dramatically! In fact, later LLaMA generations used this exact optimization---LLaMA-3 8B has 32 query heads and 8 KV heads (\href{https://huggingface.co/MaziyarPanahi/Llama-3-13B-Instruct-v0.1/blob/dfdeb40bdb2c149dfa399ea2be0d56eb120f0831/config.json}{source}).
+
+\begin{takeawaybox}
+In addition to params, the size of KV cache has a lot of bearing over the ultimate inference performance of the model. We want to keep it under control with a combination of architectural decisions and runtime optimizations.
+\end{takeawaybox}

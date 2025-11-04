@@ -1,0 +1,145 @@
+\subsection{Combining FSDP and Tensor Parallelism}
+
+\textbf{Syntax:} $\text{In}[B_X, D_Y] \cdot_D W_\text{in}[D_X, F_Y] \cdot_F W_\text{out}[F_Y, D_X] \rightarrow \text{Out}[B_X, D_Y]$
+
+The nice thing about FSDP and tensor parallelism is that they can be combined. By sharding \textbf{W\textsubscript{in}} and \textbf{W\textsubscript{out}} along both axes we both save memory and compute. Because we shard $B$ along $X$, we reduce the size of the model-parallel AllGathers, and because we shard $F$ along $Y$, we reduce the communication overhead of FSDP. This means a combination of the two can get us to an even lower effective batch size than we saw above.
+
+\begin{figure}[htb]
+    \centering
+    \includegraphics[width=\textwidth]{images/mixed-fsdp-model-parallelism.png}
+    \caption{A diagram combining FSDP and tensor parallelism. Unlike the other cases, there is no duplication of model parameters.}
+    \label{fig:mixed-fsdp-model-parallelism}
+\end{figure}
+
+{\footnotesize
+\begin{tcolorbox}[algorithmbox, title=Algorithm: Combining FSDP and Tensor Parallelism]
+
+\textbf{Forward pass:} need to compute Loss[B]
+
+\begin{enumerate}
+    \item In[B\textsubscript{X}, D] = \textbf{AllGather}\textsubscript{Y}(In[B\textsubscript{X}, D\textsubscript{Y}]) \textit{(on critical path)}
+    \item W\textsubscript{in}[D, F\textsubscript{Y}] = \textbf{AllGather}\textsubscript{X}(W\textsubscript{in}[D\textsubscript{X}, F\textsubscript{Y}]) \textit{(can be done ahead of time)}
+    \item Tmp[B\textsubscript{X}, F\textsubscript{Y}] = In[B\textsubscript{X}, D] *\textsubscript{D} W\textsubscript{in}[D, F\textsubscript{Y}]
+    \item W\textsubscript{out}[F\textsubscript{Y}, D] = \textbf{AllGather}\textsubscript{X}(W\textsubscript{out}[F\textsubscript{Y}, D\textsubscript{X}]) \textit{(can be done ahead of time)}
+    \item Out[B\textsubscript{X}, D] \{U.Y\} = Tmp[B\textsubscript{X}, F\textsubscript{Y}] *\textsubscript{F} W\textsubscript{out}[F\textsubscript{Y}, D]
+    \item Out[B\textsubscript{X}, D\textsubscript{Y}] = \textbf{ReduceScatter}\textsubscript{Y}(Out[B\textsubscript{X}, D] \{U.Y\}) \textit{(on critical path)}
+    \item Loss[B\textsubscript{X}] = ...
+\end{enumerate}
+
+\textbf{Backward pass:} need to compute dW\textsubscript{out}[F\textsubscript{Y}, D\textsubscript{X}], dW\textsubscript{in}[D\textsubscript{X}, F\textsubscript{Y}]
+
+\begin{enumerate}
+    \item dOut[B\textsubscript{X}, D\textsubscript{Y}] = ...
+    \item dOut[B\textsubscript{X}, D] = \textbf{AllGather}\textsubscript{Y}(dOut[B\textsubscript{X}, D\textsubscript{Y}]) \textit{(on critical path)}
+    \item dW\textsubscript{out}[F\textsubscript{Y}, D] \{U.X\} = Tmp[B\textsubscript{X}, F\textsubscript{Y}] *\textsubscript{B} dOut[B\textsubscript{X}, D]
+    \item dW\textsubscript{out}[F\textsubscript{Y}, D\textsubscript{X}] = \textbf{ReduceScatter}\textsubscript{X}(dW\textsubscript{out}[F\textsubscript{Y}, D] \{U.X\})
+    \item W\textsubscript{out}[F\textsubscript{Y}, D] = \textbf{AllGather}\textsubscript{X}(W\textsubscript{out}[F\textsubscript{Y}, D\textsubscript{X}]) \textit{(can be done ahead of time)}
+    \item dTmp[B\textsubscript{X}, F\textsubscript{Y}] = dOut[B\textsubscript{X}, D] *\textsubscript{D} W\textsubscript{out}[F\textsubscript{Y}, D] \textit{(can throw away dOut[B, D] here)}
+    \item In[B\textsubscript{X}, D] = \textbf{AllGather}\textsubscript{Y}(In[B\textsubscript{X}, D\textsubscript{Y}]) \textit{(not on critical path + this can be shared with (2) from the previous layer)}
+    \item dW\textsubscript{in}[D, F\textsubscript{Y}] \{U.X\} = dTmp[B\textsubscript{X}, F\textsubscript{Y}] *\textsubscript{B} In[B\textsubscript{X}, D]
+    \item dW\textsubscript{in}[D\textsubscript{X}, F\textsubscript{Y}] = \textbf{ReduceScatter}\textsubscript{X}(dW\textsubscript{in}[D, F\textsubscript{Y}] \{U.X\})
+    \item W\textsubscript{in}[D, F\textsubscript{Y}] = \textbf{AllGather}\textsubscript{X}(W\textsubscript{in}[D\textsubscript{X}, F\textsubscript{Y}]) \textit{(can be done ahead of time)}
+    \item dIn[B\textsubscript{X}, D] \{U.Y\} = dTmp[B\textsubscript{X}, F\textsubscript{Y}] *\textsubscript{F} W\textsubscript{in}[D, F\textsubscript{Y}] \textit{(needed for previous layers)}
+    \item dIn[B\textsubscript{X}, D\textsubscript{Y}] = \textbf{ReduceScatter}\textsubscript{Y}(dIn[B\textsubscript{X}, D] \{U.Y\}) \textit{(on critical path)}
+\end{enumerate}
+
+\end{tcolorbox}
+}
+
+\textbf{What's the right combination of FSDP and TP?} A simple but key maxim is that FSDP moves weights and tensor parallelism moves activations. That means as our batch size shrinks (especially as we do more data parallelism), tensor parallelism becomes cheaper because our activations per-shard are smaller.
+
+\begin{itemize}
+    \item Tensor parallelism performs $\mathbf{AllGather}_Y([B_X, D_Y])$ which shrinks as $X$ grows.
+    \item FSDP performs $\mathbf{AllGather}_X([D_X, F_Y])$ which shrinks as $Y$ grows.
+\end{itemize}
+
+Thus by combining both we can push our minimum batch size per replica down even more. We can calculate the optimal amount of FSDP and TP in the same way as above:
+
+Let $X$ be the number of chips dedicated to FSDP and $Y$ be the number of chips dedicated to tensor parallelism. Let $N$ be the total number of chips in our slice with $N=XY$. Let $M_X$ and $M_Y$ be the number of mesh axes over which we do FSDP and TP respectively (these should roughly sum to~3). We'll purely model the forward pass since it has the most communication per FLOP. Then adding up the comms in the algorithm above, we~have
+
+\begin{align*}
+T_\text{FSDP comms}(B, X, Y) &= \frac{2\cdot 2\cdot D \cdot F}{Y \cdot W_\text{ici} \cdot M_X} \\
+T_\text{TP comms}(B, X, Y) &= \frac{2 \cdot 2 \cdot B \cdot D}{X \cdot W_\text{ici} \cdot M_Y}
+\end{align*}
+
+And likewise our total FLOPs time~is
+
+$$T_\text{math} = \frac{2\cdot 2 \cdot B \cdot D \cdot F}{N \cdot C}.$$
+
+To simplify the analysis, we make two assumptions: first, we allow $X$ and $Y$ to take on non-integer values (as long as they are positive and satisfy $XY=N$); second, we assume that we can fully overlap comms on the $X$ and $Y$ axis with each other. Under the second assumption, the total comms time~is
+
+$$T_\text{comms} = \max\left(T_\text{FSDP comms}, T_\text{TP comms}\right)$$
+
+Before we ask under what conditions we'll be compute-bound, let's find the optimal values for $X$ and $Y$ to minimize our total communication. Since our FLOPs is independent of $X$ and $Y$, the optimal settings are those that simply minimize comms. To do this, let's write $T_\text{comms}$ above in terms of $X$ and $N$ (which is held fixed, as it's the number of chips in our system) rather than $X$ and $Y$:
+
+\begin{align*}
+T_\text{comms} (X) &= \frac{4D}{W_\text{ici}} \max\left(\frac{F \cdot X}{N \cdot M_X}, \frac{B}{X \cdot M_Y}\right)
+\end{align*}
+
+Because $T_\text{FSDP comms}$ is monotonically increasing in $X$, and $T_\text{TP comms}$ is monotonically decreasing in $X$, the maximum must be minimized when $T_\text{FSDP comms} = T_\text{TP comms}$, which occurs~when
+
+\begin{align*}
+\frac{FX_{opt}}{M_X} = \frac{BN}{X_{opt} M_Y} \rightarrow \\
+X_{opt} = \sqrt{\frac{B}{F} \frac{M_X}{M_Y} N}
+\end{align*}
+
+This is super useful! This tells us, for a given $B$, $F$, and $N$, what amount of FSDP is optimal. Let's get a sense of scale. Plugging in realistic values, namely $N = 64$ (corresponding to a~4x4x4 array of chips), $B=48,000$, $F=32768$, gives roughly $X\approx 13.9$. So we would choose $X$ to be~16 and $Y$ to be~4, close to our calculated optimum.
+
+\begin{tcolorbox}[takeawaybox]
+In general, during training, the optimal amount of FSDP is $X_{opt} = \sqrt{\frac{B}{F} \frac{M_X}{M_Y} N}$.
+\end{tcolorbox}
+
+Now let's return to the question we've been asking of all our parallelism strategies: \textbf{under what conditions will we be compute-bound?} Since we can overlap FLOPs and comms, we are compute-bound~when
+
+$$\max\left(T_\text{FSDP comms}, T_\text{TP comms}\right) < T_\text{math}$$
+
+By letting $\alpha \equiv C / W_\text{ici}$, the ICI arithmetic intensity, we can~simplify:
+
+$$\max\left(\frac{F}{Y \cdot M_X}, \frac{B}{X \cdot M_Y}\right) < \frac{B \cdot F}{N \cdot \alpha}$$
+
+Since we calculated $X_{opt}$ to make the LHS maximum equal, we can just plug it into either side (noting that $Y_{opt} = N/X_{opt}$), i.e.
+
+\begin{align*}
+&\frac{F}{N \cdot W_\text{ici} \cdot M_X} \sqrt{\frac{B}{F} \frac{M_X}{M_Y} N} \\
+&\quad < \frac{B \cdot F}{N \cdot C}
+\end{align*}
+
+Further simplifying, we find~that
+
+$$ \sqrt{\frac{B\cdot F}{M_X \cdot M_Y \cdot N}} < \frac{B \cdot F}{N \cdot \alpha},$$
+
+where the left-hand-side is proportional to the communication time and the right-hand-side is proportional to the computation time. Note that while the computation time scales linearly with the batch size (as it does regardless of parallelism), the communication time scales as the square root of the batch size. The ratio of the computation to communication time thus also scales as the square of the batch~size:
+
+$$ \frac{T_\text{math}}{T_\text{comms}} = \frac{\sqrt{BF}\sqrt{M_X M_Y}}{\alpha \sqrt{N}}. $$
+
+To ensure that this ratio is greater than one so we are compute bound, we~require
+
+$$ \frac{B}{N} > \frac{\alpha^2}{M_X M_Y F}$$
+
+To get approximate numbers, again plug in $F=32,768$, $\alpha=2550$, and $M_X M_Y=2$ (as it must be for a~3D~mesh). This gives roughly $B/N > 99$. This roughly wins us a factor of eight compared to the purely data parallel (or FSDP) case, where assuming a~3D~mesh we calculate that $B/N$ must exceed about~850 to be compute bound.
+
+\begin{tcolorbox}[takeawaybox]
+Combining tensor parallelism with FSDP allows us to drop to a~$B/N$ of $2550^2 / 2F$. This lets us handle a batch of as little as~100 per chip, which is roughly a factor of eight smaller than we could achieve with just FSDP.
+\end{tcolorbox}
+
+Below we plot the ratio of FLOPs to comms time for mixed FSDP~+~TP, comparing it both to only tensor parallelism (TP) and only data parallelism (FSDP), on a representative 4x4x4 chip array. While pure FSDP parallelism dominates for very large batch sizes, in the regime where batch size over number of chips is between roughly~100 and~850, a mixed FSDP~+~TP strategy is required in order to be compute-bound.
+
+\begin{figure}[htb]
+    \centering
+    \includegraphics[width=\textwidth]{images/mixed-fsdp-comms-2.png}
+    \caption{Ratio of FLOPs to comms time for optimal mixed FSDP/TP on a TPUv5p 4x4x4 slice with F=30k. As expected, tensor parallelism has a fixed ratio with batch size; ideal mixed FSDP~+~TP scales with $\sqrt{B}$, and FSDP scales with~$B$. However, in intermediate batch size regimes, only FSDP~+~TP achieves a ratio greater than unity.}
+    \label{fig:mixed-fsdp-comms-2}
+\end{figure}
+
+Here's another example of TPU v5p 16x16x16 showing the FLOPs and comms time as a function of batch size for different sharding schemes.
+
+\begin{figure}[htb]
+    \centering
+    \includegraphics[width=\textwidth]{images/math-comms-time.png}
+    \caption{Time taken for communication with different parallelism schemes. The black dashed line is the time taken by the matrix multiplication FLOPs, so any curve above this line is comms-bound. We note that all strategies become comms-bound below batch size 6e5, which is in line with our expected $4096 \times 2550^2 / (2 \times 8192 \times 4) = 4e5$.}
+    \label{fig:math-comms-time}
+\end{figure}
+
+The black curve is the amount of time spent on model FLOPs, meaning any batch size where this is lower than all comms costs is strictly comms bound. You'll notice the black curve intersects the green curve at about~\texttt{4e5}, as predicted.
+
+You'll notice this generally agrees with the above (minimum around FSDP=256, TP=16), plus or minus some wiggle factor for some slight differences in the number of axes for each.

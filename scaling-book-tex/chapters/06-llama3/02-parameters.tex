@@ -1,0 +1,26 @@
+\section{Counting parameters and FLOPs}
+
+\textbf{Question:} From this table, can we calculate the LLaMA 3-70B parameter count? Let's apply the content of Section~\ref{chap:transformers} and see if we can get 70B!
+
+{\scriptsize
+\setlength{\tabcolsep}{1.5pt}
+\begin{longtable}{p{1.7cm}p{5cm}p{2.3cm}}
+\toprule
+\textbf{param} & \textbf{formula} & \textbf{count} \\
+\midrule
+FFW params & d\_model * d\_ff * 3 (gelu + out-proj) * n\_layers & 8,192 * 8,192 * 3.5 * 3 * 80 = \textbf{56.3e9} \\
+\addlinespace
+Vocab params & 2 (input \& output emb.) * n\_embeddings * d\_model & 2 * 128,256 * 8,192 = \textbf{2.1e9} \\
+\addlinespace
+Attention params & n\_layers * [ 2 (q emb. \& concat. out proj.) * d\_model * n\_heads * d\_qkv + 2 (k \& v) * d\_model * n\_kv\_heads * d\_qkv] & 80 * (2 * 8,192 * 64 * 128 + 2 * 8,192 * 8 * 128) = \textbf{12e9} \\
+\addlinespace
+ & & 56.3e9 + 2.1e9 + 12e9 = \textbf{70.4e9} \\
+\bottomrule
+\end{longtable}
+}
+
+That's great! We get the number we expect. You'll notice as expected that the FFW parameters totally dominate the overall parameter count, although attention is non-trivial.
+
+\begin{takeawaybox}
+The 3~big weight matrices in the MLP block are so much larger than all the other arrays in the Transformer that we can typically almost ignore all other parameters when reasoning about model memory or FLOPs. For LLaMA 3-70B, they represent 56B of 70B parameters.
+\end{takeawaybox}

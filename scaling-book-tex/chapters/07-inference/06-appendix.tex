@@ -1,0 +1,108 @@
+\section{Appendix}
+
+\subsection{Appendix A: How real is the batch size > 240 rule?}
+
+The simple rule we provided above, that our batch size must be greater than 240 tokens to be compute-bound, is roughly true but ignores some ability of the TPU to prefetch the weights while other operations are not using all available HBM, like when doing inter-device communication.
+
+Here's an empirical plot of layer time (in microseconds) for a small Transformer with $d_{\text{model}}$ 8192, $d_{\text{ff}}$ 32768, and only 2 matmuls per layer. This comes from \href{https://colab.sandbox.google.com/drive/1_6krERgtolH7hbUIo7ewAMLlbA4fqEF8?usp=sharing}{this Colab notebook}. You'll see that step time increases very slowly up until around batch 240, and then increases linearly.
+
+\begin{figure}[htb]
+\centering
+\includegraphics[width=\textwidth]{images/batch-scaling-latency.png}
+\end{figure}
+
+Here's the actual throughput in tokens / us. This makes the argument fairly clearly. Since our layer is about 600M parameters sharded 4 ways here, we'd expect a latency of roughly 365us at minimum.
+
+\begin{figure}[htb]
+\centering
+\includegraphics[width=\textwidth]{images/batch-scaling-throughput.png}
+\end{figure}
+
+So at least in this model, we do in fact see throughput increase until about BS240 per data parallel shard.
+
+\subsection{Appendix B: 2D Weight Stationary sharding}
+
+As the topology grows, if we have access to higher dimensional meshes (like that of TPUs) it is possible to refine this further with ``\textbf{2D Weight Sharding}''. By introducing a second sharding axis. We call this ``\textbf{2D Weight Stationary}'', and was described in more detail in the \href{https://arxiv.org/abs/2211.05102}{Efficiently Scaling Transformer Inference paper}.
+
+Because we're only sharding the hidden $F$ dimension in Megatron, it can become significantly smaller than $E$ (the $d_{\text{model}}$ dimension) once the number of chips grows large with 1D sharding. This means at larger batch sizes, it can be more economical to perform a portion of the collectives over the hidden dimension after the first layer of the MLP is applied.
+
+\begin{figure}[htb]
+\centering
+\includegraphics[width=\textwidth]{images/2d-weight-stationary.png}
+\end{figure}
+
+This figure shows:
+
+\begin{enumerate}
+\item 1D weight-stationary sharding, a.k.a. Pure Megatron sharding, where activations are fully replicated after AllGather, and weights are fully sharded over the hidden F dimension.
+\item 2D weight stationary sharding, where weights are sharded over both the hidden F and reduction E dimension, and activations are sharded over the E dimension. We perform an AllGather on the (yz) axis before the first layer, then ReduceScatter on the (x) axis.
+\end{enumerate}
+
+For the attention layer, Megatron style sharding is also relatively simple for smaller numbers of chips. However, Megatron happens over the $n_{\text{heads}}$ dimension, which puts a limit on the amount of sharding that is possible. Modifying the 2D sharding with for (instead of sharding the hidden, we shard the $n_{\text{heads}}$ dimension), we gain the ability to scale further.
+
+\subsection{Appendix C: Latency bound communications}
+
+As a recap, in Section 3 we derived the amount of time it takes to perform an AllGather into a tensor of size B on each TPU, over X chips on a 1D ring links of full duplex bandwidth of WICI and latency Tmin.
+
+\begin{equation*}
+T_{\text{total}} = \max\left(\frac{T_{\text{min}} \cdot |X|}{2}, \frac{B}{W_{\text{ICI}}}\right)
+\end{equation*}
+
+For large B, the wall clock stays relatively constant because as you add more chips to the system, you simultaneously scale the amount of data movement necessary to perform the operation and the total bandwidth available.
+
+% Note: all-gather.gif is an animated GIF that cannot be included in PDF
+% (XeLaTeX does not support GIF format)
+
+Because of the relatively low amounts of data being moved during latency optimized inference, collectives on activations are often bound by the latency term (especially for small batch sizes). One can visualise the latency quite easily, by counting the number of hops we need to complete before it is completed.
+
+On TPUs, if the tensor size-dependent part of communication is less than 1 microsecond per hop (a hop is communication between two adjacent devices) we can be bottlenecked by the fixed overhead of actually dispatching the collective. With \texttt{4.5e10} unidirectional ICI bandwidth, ICI communication becomes latency bound when: $(\text{bytes} / n_{\text{shards}}) / 4.5e10 < 1e-6$ For 8-way Megatron sharding, this is when \texttt{buffer\_size < 360kB}. \textbf{This actually is not that small during inference:} with \texttt{BS=16} and \texttt{D=8192} in int8, our activations will use \texttt{16*8192=131kB}, so we're already latency bound.
+
+\begin{takeawaybox}
+Our comms become latency bound when $\text{total bytes} < W_{\text{ICI}} \times 1e-6$~. For instance, with model parallelism over $Y$, we become bound in int8 when $Y > BD / 45,000$~.
+\end{takeawaybox}
+
+There's a parallel to be drawn here with the compute roofline---we are incurring the fixed cost of some small operations (latency for comms, memory bandwidth for matmuls).
+
+\subsection{Appendix D: Speculative Sampling}
+
+When we \textit{really} care about end to end latency, there is one extra trick we can employ called speculative sampling~\cite{spec1}~\cite{spec2}. As a recap, we usually generate tokens from a large Transformer one by one:
+
+\begin{figure}[htb]
+\centering
+\includegraphics[width=\textwidth]{images/spec-sampling1.png}
+\end{figure}
+
+With speculative sampling, we use a smaller, cheaper model to generate tokens and then check the result with the big model. This is easiest to understand with \textit{greedy decoding}:
+
+\begin{figure}[htb]
+\centering
+\includegraphics[width=\textwidth]{images/spec-sampling2.png}
+\end{figure}
+
+\begin{enumerate}
+\item We sample greedily from some smaller, cheaper model. Ideally we use a model trained to match the larger model, e.g. by distillation, but it could be as simple as simply using n-grams or token matching a small corpus of text.
+\item After we've generated K tokens, we use the big model to compute the next-token logits for all the tokens we've generated so far.
+\item Since we're decoding greedily, we can just check if the token generated by the smaller model has the highest probability of all possible tokens. If one of the tokens is wrong, we take the longest correct prefix and replace the first wrong token with the correct token, then go back to (1). If all the tokens are correct, we can use the last correct logit to sample an extra token before going back to (1).
+\end{enumerate}
+
+\textbf{Why is this a latency win?} This scheme still requires us to do the FLOPs-equivalent of one forward pass through the big model for every token, but because we can batch a bunch of tokens together, we can do all these FLOPs in one forward pass and take advantage of the fact that we're \textit{not} \textit{compute-bound} to score more tokens for free.
+
+Every accepted token becomes more expensive in terms of FLOPs on average (since some will be rejected, and we have to call a draft model), but we wring more FLOPs out of the hardware, and the small model is cheap, so we win overall. We also share KV cache loads across multiple steps, so \textbf{speculative decoding can also be a throughput win for long context.} Since everything has been checked by the big model, we don't change the sampling distribution at all (though the exact trajectory will differ for non-greedy).
+
+Traditionally, speculative decoding relies on the existence of a smaller model with a similar sampling distribution to the target model, e.g. LLaMA-2 2B for LLaMA-2 70B, which often doesn't exist. Even when this is available, the smaller drafter can still be too expensive if the acceptance rate is low. Instead, it can be helpful to embed a drafter within the main model, for instance by adding a dedicated drafter head to one of the later layers of the base model~\cite{eagle}~\cite{medusa}~\cite{DeepSeek3}. Because this head shares most of its parameters with the main model, it's faster to run and matches the sampling distribution more closely.
+
+For normal autoregressive sampling the token/s is the same as the step time. We are still beholden to the theoretical minimum step time according to the Arithmetic Intensity section here (in fact, Speculative Sampling step times are usually quite a bit slower than normal autoregressive sampling, but because we get more than 1 token out per step on average we can get much better tokens/s).
+
+\begin{figure}[htb]
+\centering
+\includegraphics[width=\textwidth]{images/spec-sampling3.png}
+\caption{This figure shows the per-step latency and speculation success rate for Chinchilla (a 70B model from DeepMind) with a 4B parameter drafter (small model). For XSum (a natural language dataset), the ideal amount of speculation is about 3-4 tokens ahead, while HumanEval (a coding dataset) is more predictable and sees wins from more aggressive speculation.}
+\end{figure}
+
+\textbf{How does this work for non-greedy decoding?} This is a bit more complicated, but essentially boils down to a Metropolis-Hastings inspired algorithm where have $P_{\text{draft model}}(\text{chosen token})$ and $P_{\text{target model}}(\text{chosen token})$ derived from the logits, and reject the chosen token probabilistically if the ratio of these probabilities is smaller than some threshold.
+
+These \href{https://arxiv.org/abs/2211.17192}{two} \href{https://arxiv.org/abs/2302.01318}{papers} derived this concurrently and have good examples of how this works in practice.
+
+\begin{takeawaybox}
+Speculative sampling is yet another powerful lever for trading throughput for better per token latency. However, in the scenario where batch size is limited (e.g. small hardware footprint or large KV caches), it becomes a win-win.
+\end{takeawaybox}

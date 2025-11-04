@@ -1,0 +1,68 @@
+\subsection{Fully-Sharded Data Parallelism (FSDP)}
+
+\textbf{Syntax:} $\text{In}[B_X, D] \cdot_D W_\text{in}[D_X, F] \cdot_F W_\text{out}[F, D_X] \rightarrow \text{Out}[B_X, D]$
+
+Fully-sharded data parallelism (often called FSDP or ZeRO-sharding~\cite{zero}) splits the model optimizer states and weights across the data parallel shards and efficiently gathers and scatters them as needed. \textbf{Compared to pure data parallelism, FSDP drastically reduces per-device memory usage and saves on backward pass FLOPs, with very minimal overhead.}
+
+\begin{figure}[htb]
+\centering
+\includegraphics[width=\textwidth]{images/fsdp.png}
+\caption{FSDP shards the contracting dimension of $W_{\text{in}}$ and the output dimension of $W_{\text{out}}$ along the data dimension. This reduces memory but (from Section~3) requires us to gather the weights for $W$ before we perform the matmul. Note that the activations (left) \textit{are not sharded along the contracting dimension}, which is what forces us to gather. \textbf{Note that our weight optimizer state is likewise sharded along the contracting dimension.}}
+\end{figure}
+
+You'll remember (from Section 3) that an AllReduce can be decomposed into an AllGather and a ReduceScatter. This means that, instead of doing the full gradient AllReduce for standard data parallelism, we can shard the weights and optimizer states across chips, AllGather them at each layer during the forward pass and ReduceScatter across the weights during the backward pass at no extra cost.
+
+\begin{algorithmbox}
+\textbf{Fully-Sharded Data Parallelism (FSDP):}
+
+\textbf{Forward pass:} need to compute Loss[$B_X$]
+
+\begin{enumerate}
+    \item $W_{\text{in}}$[D, F] = \textbf{AllGather}($W_{\text{in}}$[$D_X$, F]) (\textit{not on critical path, can do it during previous layer})
+    \item Tmp[$B_X$, F] = In[$B_X$, D] $*_D$ $W_{\text{in}}$[D, F] (\textit{can throw away $W_{\text{in}}$[D, F] now})
+    \item $W_{\text{out}}$[F, D] = \textbf{AllGather}($W_{\text{out}}$[F, $D_X$]) (\textit{not on critical path, can do it during previous layer})
+    \item Out[$B_X$, D] = Tmp[$B_X$, F] $*_F$ $W_{\text{out}}$[F, D]
+    \item Loss[$B_X$] = ...
+\end{enumerate}
+
+\textbf{Backward pass:} need to compute $\text{dW}_{\text{out}}$[F, $D_X$], $\text{dW}_{\text{in}}$[$D_X$, F]
+
+\begin{enumerate}
+    \item dOut[$B_X$, D] = ...
+    \item $\text{dW}_{\text{out}}$[F, D] \{$U_X$\} = Tmp[$B_X$, F] $*_B$ dOut[$B_X$, D]
+    \item $\text{dW}_{\text{out}}$[F, $D_X$] = \textbf{ReduceScatter}($\text{dW}_{\text{out}}$[F, D] \{$U_X$\}) (\textit{not on critical path, can be done async})
+    \item $W_{\text{out}}$[F, D] = \textbf{AllGather}($W_{\text{out}}$[F, $D_X$]) (\textit{can be done ahead of time})
+    \item dTmp[$B_X$, F] = dOut[$B_X$, D] $*_D$ $W_{\text{out}}$[F, D] (\textit{can throw away $W_{\text{out}}$[F, D] here})
+    \item $\text{dW}_{\text{in}}$[D, F] \{$U_X$\} = dTmp[$B_X$, F] $*_B$ In[$B_X$, D]
+    \item $\text{dW}_{\text{in}}$[$D_X$, F] = \textbf{ReduceScatter}($\text{dW}_{\text{in}}$[D, F] \{$U_X$\}) (\textit{not on critical path, can be done async})
+    \item $W_{\text{in}}$[D, F] = \textbf{AllGather}($W_{\text{in}}$[$D_X$, F]) (\textit{can be done ahead of time})
+    \item dIn[$B_X$, D] = dTmp[$B_X$, F] $*_F$ $W_{\text{in}}$[D, F] (\textit{needed for previous layers}) (\textit{can throw away $W_{\text{in}}$[D, F] here})
+\end{enumerate}
+\end{algorithmbox}
+
+This is also called ``ZeRO Sharding'', from ``ZeRo Overhead sharding'' since we don't perform any unnecessary compute or store any unnecessary state. ZeRO-\{1,2,3\} are used to refer to sharding the optimizer states, gradients, and weights in this way, respectively. Since all have the same communication cost\footnote{Technically, FSDP adds communication in the forward pass that pure DP doesn't have, but this is in the same proportion as the backward pass so it should have no effect on the comms roofline. The key here is that ZeRO-3 turns a backward-pass AllReduce into an AllGather and a ReduceScatter, which have the same total comms volume.}, we can basically always do ZeRO-3 sharding, which shards the parameters, gradients, and optimizer states across a set of devices.
+
+\textbf{Why would we do this?} Standard data parallelism involves a lot of duplicated work. Each TPU AllReduces the full gradient, then updates the full optimizer state (identical work on all TPUs), then updates the parameters (again, fully duplicated). For ZeRO sharding (sharding the gradients/optimizer state), instead of an AllReduce, you can ReduceScatter the gradients, update only your shard of the optimizer state, update a shard of the parameters, then AllGather the parameters as needed for your forward pass.
+
+\textbf{When do we become bottlenecked by communication?} Our relative FLOPs and comms costs are exactly the same as pure data parallelism, since each AllReduce in the backward pass has become an AllGather + ReduceScatter. Recall that an AllReduce is implemented as an AllGather and a ReduceScatter, each with half the cost. Here we model the forward pass since it has the same FLOPs-to-comms ratio as the backward pass:
+
+$$\begin{aligned}
+T_\text{math} &= \frac{2 \cdot 2 \cdot B \cdot D \cdot F}{X \cdot C} \\
+T_\text{comms} &= \frac{2 \cdot 2 \cdot D \cdot F}{W_\text{ici}} \\
+T &\approx \max\left(\frac{4 \cdot B \cdot D \cdot F}{X \cdot C}, \frac{4 \cdot D \cdot F}{W_\text{ici}}\right) \\
+T &\approx 4 \cdot D \cdot F \cdot \max\left(\frac{B}{X \cdot C}, \frac{1}{W_\text{ici}}\right)
+\end{aligned}$$
+
+Therefore, as with pure data-parallelism, we are compute bound when $B / X > C / W_\text{ici}$, i.e. when the per-device batch size $B/X$ exceeds the ``ICI operational intensity'' $C/W_\text{ici}$ (\texttt{4.59e14 / 1.8e11 = 2550} for v5p). This is great for us, because it means if our per-device batch size is big enough to be compute-bound for pure data-parallelism, we can --- without worrying about leaving the compute-bound regime --- simply upgrade to FSDP, saving ourselves a massive amount of parameter and optimizer state memory!~ Though we did have to add communication to the forward pass, this cost is immaterial since it just overlaps with forward-pass FLOPs.
+
+\begin{takeawaybox}
+Both FSDP and pure Data Parallelism become bandwidth bound on TPUv5 when the batch size per device is less than $2550 / M_X$, where $M_X$ is the number of mesh axes.
+\end{takeawaybox}
+
+For example, DeepSeek-V2 (one of the only recent strong model to release information about its training batch size) used a batch size of \textasciitilde40M tokens. \textbf{This would allow us to scale to roughly 47,000 chips, or around 5 TPUv5 pods, before we hit a bandwidth limit.}
+
+For LLaMA-3 70B, which was trained for approximately \texttt{6.3e24 (15e12 * 70e9 * 6)} FLOPs, we could split a batch of 16M tokens over roughly \texttt{16e6 / (2550 / 3) = 18,823} chips (roughly 2 pods of 8960 chips), each with \texttt{4.59e14} FLOPs running at 50\% peak FLOPs utilization (often called MFU), and \textbf{train it in approximately 17 days}. Not bad! But let's explore how we can do better.
+
+\begin{takeawaybox}
+\textbf{Note on critical batch size:} Somewhat unintuitively, we become more communication bottlenecked as our total batch size decreases (with fixed chip number). Data parallelism and FSDP let us scale to arbitrarily many chips so long as we can keep increasing our batch size! However, in practice, as our batch size increases, we tend to see diminishing returns in training since our gradients become almost noise-free. We also sometimes see training instability. Thus, the game of finding an optimal sharding scheme in the ``unlimited compute regime'' often starts from a fixed batch size, determined by scaling laws, and a known (large) number of chips, and then aims to find a partitioning that allows us to fit that small batch size on so many chips.
+\end{takeawaybox}

@@ -1,0 +1,9 @@
+\textbf{Question:} LLaMA 3-70B was pretrained with a batch size of about 4M tokens. How many TPUs do we need at minimum to train with this batch size? \textit{You can assume bfloat16 parameters and float32 optimizer state, and that you checkpoint gradients 4 times per layer.}
+
+\textit{Why wouldn't we do this?} Well, because it would take us \texttt{44 days * 8960 / 225 = 1752 days}~to train. That's nearly four years. \textbf{That's a lot.} Still, this makes it clear that we're using these large clusters not because we're bound by memory but rather because we need the extra FLOPs.
+
+\textbf{Question:} Under the same assumptions as the question above, if we use 8960 TPU v5p chips, how much memory will we use per-chip?
+
+\begin{takeawaybox}
+It is technically possible to train even very large models on very small topologies, with the caveat that they will likely take a long time. Being able to calculate the total FLOPs of a training run allows us to ballpark its training time by assuming a modest MFU and a known topology.
+\end{takeawaybox}

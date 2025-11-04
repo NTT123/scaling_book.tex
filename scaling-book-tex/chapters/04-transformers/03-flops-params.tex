@@ -1,0 +1,90 @@
+\section{Global FLOPs and Params Calculation}
+
+For the below we're going to compute per-layer FLOPs to avoid having to stick factors of \textbf{L} everywhere.
+
+\subsection{MLPs}
+
+The MLPs of a Transformer typically consist of 2 input matmuls that are element-wise combined and a single output matmul:
+
+\begin{equation*}
+\begin{array}{ccc}
+\textrm{operation} & \textrm{train FLOPs} & \textrm{params} \\
+\hline \\
+A[B,T,\textcolor{red}{D}] \cdot W_{in1}[\textcolor{red}{D}, F] & 6BTDF & DF \\[10pt]
+A[B,T,\textcolor{red}{D}] \cdot W_{in2}[\textcolor{red}{D}, F] & 6BTDF & DF \\[10pt]
+\sigma\left(A_{in1}\right)[B,T, F] * A_{in2}[B,T, F] & \textcolor{gray}{O(BTF)} \\[10pt]
+A[B,T,\textcolor{red}{F}] \cdot W_{out}[\textcolor{red}{F}, D] & 6BTDF & DF \\[10pt]
+\hline \\
+& \approx 18BTDF & 3DF
+\end{array}
+\end{equation*}
+
+\subsection{Attention}
+
+For the generic grouped-query attention case with different \textbf{Q} and \textbf{KV} head numbers, let us assume equal head dimension H for \textbf{Q},\textbf{K},\textbf{V} projections, and estimate the cost of the \textbf{QKVO} matmuls:
+
+\begin{equation*}
+\begin{array}{ccc}
+\textrm{operation} & \textrm{train FLOPs} & \textrm{params} \\
+\hline \\
+A[B,T,\textcolor{red}{D}] \cdot W_{Q}[\textcolor{red}{D}, N, H] & 6BTDNH & DNH \\[10pt]
+A[B,T,\textcolor{red}{D}] \cdot W_{K}[\textcolor{red}{D}, K, H] & 6BTDKH & DKH \\[10pt]
+A[B,T,\textcolor{red}{D}] \cdot W_{V}[\textcolor{red}{D}, K, H] & 6BTDKH & DKH \\[10pt]
+A[B,T,\textcolor{red}{N}, \textcolor{red}{H}] \cdot W_{O}[\textcolor{red}{N}, \textcolor{red}{H}, D] & 6BTDNH & DNH \\[10pt]
+\hline \\ & 12BTD(N+K)H & 2D(N+K)H
+\end{array}
+\end{equation*}
+
+The dot-product attention operation is more subtle, effectively being a $TH \cdot HS$ matmul batched over the $B$, $K$ dimensions, a softmax, and a $TS \cdot SH$ matmul again batched over the $B$, $K$ dimensions. We highlight the batched dims in blue:
+
+\begin{equation*}
+\begin{array}{cc}
+\textrm{operation} & \textrm{train FLOPs} \\
+\hline \\[3pt]
+Q[\textcolor{blue}{B}, T, \textcolor{blue}{K}, G, \textcolor{red}{H}] \cdot K[\textcolor{blue}{B}, S, \textcolor{blue}{K}, \textcolor{red}{H}]
+& 6BTSKGH = 6BTSNH  \\[3pt]
+\textrm{softmax}_S \;\; L[B, T, S, K, G] & \textcolor{gray}{O(BTSKG) = O(BTSN)} \\[3pt]
+S[\textcolor{blue}{B}, T, \textcolor{red}{S}, \textcolor{blue}{K}, G] \cdot V[\textcolor{blue}{B}, \textcolor{red}{S}, \textcolor{blue}{K}, H]
+& 6BTSKGH = 6BTSNH \\[3pt]
+\hline \\
+& \approx 12BTSNH = 12BT^2NH \\
+\end{array}
+\end{equation*}
+
+\subsection{Other Operations}
+
+There are several other operations happening in a Transformer.  Layernorms are comparatively cheap and can be ignored for first-order cost estimates. There is also the final enormous (though not per-layer) unembedding matrix multiply.
+
+\begin{equation*}
+\begin{array}{ccc}
+\textsf{operation} & \textsf{train FLOPs} & \textsf{params} \\
+\hline \\
+\textrm{layernorm}_D \;\; A[B,T,\textcolor{red}{D}] & \textcolor{gray}{O\left(BTD\right)} & \textcolor{gray}{D} \\[10pt]
+A[B,T,\textcolor{red}{D}] \cdot W_{unembed}[\textcolor{red}{D}, V] & 6BTDV & DV \\
+\end{array}
+\end{equation*}
+
+\subsection{General rule of thumb for Transformer FLOPs}
+
+If we neglect the cost of dot-product attention for shorter-context training, then the total FLOPs across all layers is
+
+\begin{align*}
+&(18BTDF + 12BTD(N+K)H)L \\
+&= 6 \times BT \times (3DF + 2D(N+K)H)L \\
+&= 6 \times \textrm{num tokens} \times \textrm{parameter count}
+\end{align*}
+
+Leading to a famous rule of thumb for estimating dense Transformer FLOP count, ignoring the attention FLOPs. (Unembedding is another simple matmul with $6BSDV$ FLOPs and $DV$ params, and follows the same rule of thumb.)
+
+\subsection{Fractional cost of attention with context length}
+
+If we do account for dot-product attention above and assume $F=4D$, $D=NH$ (as is typical) and $N=K$:
+
+{\small
+\begin{align*}
+\frac{\textrm{attention FLOPs}}{\textrm{matmul FLOPs}} &= \frac{12BT^2NH}{18BTDF + 24BTDNH} = \frac{12BT^2D}{4 \times 18 BTD^2 + 24 BTD^2} \\
+&= \frac{12BT^2D}{96 BTD^2} = \frac{T}{8D}
+\end{align*}
+}
+
+So the takeaway is that \textbf{dot-product attention FLOPs only become dominant during training once T>8D}. For D \textasciitilde{} 8k, this would be \textasciitilde{}64K tokens. This makes some sense, since it means as the MLP size increases, the attention FLOPs become less critical. For large models, the quadratic cost of attention is not actually a huge obstacle to longer context training. However, for smaller models, even e.g. Gemma-27B, D=4608 which means attention becomes dominant around 32k sequence lengths. Flash Attention also helps alleviate the cost of long-context, which we discuss briefly in Appendix A.

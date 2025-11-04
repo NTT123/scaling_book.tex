@@ -1,0 +1,74 @@
+\section*{What Have We Learned?}
+\addcontentsline{toc}{section}{What Have We Learned?}
+
+\begin{itemize}
+    \item The sharding of an array is specified by a \textbf{Mesh} that names the physical, hardware axes of our TPU mesh and a \textbf{Sharding} that assigns mesh axis names to the logical axes of the array.
+    \begin{itemize}
+        \item For example, \textbf{A}[I$_{\text{XY}}$, J] describes an abstract array \textbf{A} with its first dimension sharded along two mesh axes X and Y. Combined with Mesh(mesh\_shape=(4, 8), axis\_names=(`X', `Y')) or the abbreviated Mesh(\{`X': 4, `Y': 8\}), this tells us our array is sharded 32 ways along the first dimension.
+    \end{itemize}
+
+    \item \textbf{Arithmetic with sharded arrays works exactly like with unsharded arrays unless you perform a contraction along a sharded axis}. In that case, we have to introduce some communication. We consider four cases:
+    \begin{enumerate}
+        \item \textit{Neither array is sharded along the contracting dimension}: no communication is needed.
+        \item \textit{One array is sharded along the contracting dimension} (or the contracting dimensions are sharded along different axes): we AllGather one of the inputs before performing the operation.
+        \item \textit{Both arrays are identically sharded along the contracting dimension:} we multiply the shards locally then perform an AllReduce or ReduceScatter.
+        \item \textit{Both arrays are sharded along the same mesh axis along a non-contracting dimension:} we AllGather one of the inputs first.
+    \end{enumerate}
+
+    \item TPUs use roughly \textbf{4 core communication primitives}:
+    \begin{enumerate}
+        \item AllGather: $[A_X, B] \to [A, B]$
+        \item ReduceScatter: $[A, B] \{U_X\} \to [A, B_X]$
+        \item AllToAll: $[A, B_X] \to [A_X, B]$
+        \item AllReduce: $[A_X, B]\{U_Y\} \to [A_X, B]$ (technically not a primitive since it combines a ReduceScatter + AllGather)
+    \end{enumerate}
+\end{itemize}
+
+\begin{figure}[htb]
+    \centering
+    \includegraphics[width=\textwidth]{images/all-collectives.png}
+    \caption{All collective communication primitives used in TPU sharding.}
+    \label{fig:all-collectives}
+\end{figure}
+
+\begin{itemize}
+    \item The cost and latency of each of these operations \textbf{doesn't depend on the size of the axis (as long as they're bandwidth bound)}, but only on the size of the input arrays and the bandwidth of the link. For a unidirectional AllGather/ReduceScatter:
+\end{itemize}
+
+\begin{align}
+T_{\text{comm per AllGather or ReduceScatter}} &= \frac{\text{Data volume}}{\text{bandwidth}} \cdot \frac{\text{Axis} - 1}{\text{Axis}} \nonumber \\
+&\longrightarrow \frac{\text{Data volume}}{\text{bandwidth (bidirectional)}}
+\end{align}
+
+\begin{itemize}
+    \item An AllReduce is composed of a ReduceScatter followed by an AllGather, and thus has 2x the above cost. An AllToAll only has to pass shards part-way around the ring and is thus ¼ the cost of an AllGather. Here's a summary:
+\end{itemize}
+
+{\scriptsize
+\setlength{\tabcolsep}{2pt}
+\begin{longtable}{p{2cm} p{3cm} p{1.8cm} p{2cm}}
+\caption{Summary of collective communication operations} \\
+\toprule
+\textbf{Operation} & \textbf{Description} & \textbf{Syntax} & \textbf{Runtime} \\
+\midrule
+\endfirsthead
+
+\multicolumn{4}{c}{\tablename\ \thetable\ -- continued from previous page} \\
+\toprule
+\textbf{Operation} & \textbf{Description} & \textbf{Syntax} & \textbf{Runtime} \\
+\midrule
+\endhead
+
+\midrule
+\multicolumn{4}{r}{Continued on next page} \\
+\endfoot
+
+\bottomrule
+\endlastfoot
+
+\textbf{AllGather} & Gathers shards of an array along an axis, removing a subscript. & $[A_X, B] \to [A, B]$ & bytes / (bidir. ICI BW * num\_axes) \\
+\textbf{ReduceScatter} & Sums a partially summed array and shards it along another axis. & $[A, B] \{U_X\} \to [A_X, B]$ & Same as AllGather \\
+\textbf{AllReduce} & Sums a partially summed array. Removes \{U$_x$\}. Combines AllGather and ReduceScatter. & $[A_X, B]\{U_Y\} \to [A_X, B]$ & 2 * AllGather \\
+\textbf{AllToAll} & Gathers an axis and shards a different dimension along same axis. & $[A, B_X] \to [A_X, B]$ & AllGather / 4 (bidir. ring) \\
+\end{longtable}
+}

@@ -1,0 +1,72 @@
+\section{Appendix}
+
+\subsection{Appendix A: How does Flash Attention work?}
+
+The traditional objection to scaling Transformers to very long context is that the attention FLOPs and memory usage scale quadratically with context length. While it's true that the attention QK product has shape $[B, S, T, N]$ where B is the batch size, S and T are the Q and K sequence dims, and N is the number of heads, this claim comes with some serious caveats:
+
+\begin{enumerate}
+\item As we noted in Section 4, even though this is quadratic, the attention FLOPs only dominated when $S > 8 \cdot D$, and especially during training the memory of a single attention matrix is small compared to all of the weights and activation checkpoints living in memory, especially when sharded.
+\item We don't need to materialize the full attention matrix in order to compute attention! We can compute local sums and maxes and avoid ever materializing more than a small chunk of the array. While the total FLOPs is still quadratic, we drastically reduce memory pressure.
+\end{enumerate}
+
+This second observation was first made by \href{https://arxiv.org/abs/2112.05682}{Rabe et al. 2021} and later in the \href{https://arxiv.org/abs/2205.14135}{Flash Attention paper} (Dao et al. 2022). The basic idea is to compute the attention in chunks of K/V, where we compute the local softmax and some auxiliary statistics, then pass them onto the next chunk which combines them with its local chunk. Specifically, we compute
+
+\begin{enumerate}
+\item \textbf{M:} The running max of $q \cdot k$ over the sequence dimension
+\item \textbf{O:} The running full attention softmax over the sequence dimension
+\item \textbf{L:} The running denominator $\sum_i (q \cdot k_i - \text{running max})$
+\end{enumerate}
+
+With these, we can compute the new max, the new running sum, and the new output with only a constant amount of memory. To give a sketchy description of how this works, attention is roughly this operation:
+
+$$\text{Attn}(Q, K, V) = \sum_i \frac{\exp(Q \cdot K_i - \max_j Q \cdot K_j) V_i}{\sum_l \exp(Q \cdot K_l - \max_j Q \cdot K_j)}$$
+
+The max is subtracted for numerical stability and can be added without affecting the outcome since $\sum_i \exp(a_i + b) = \exp(b) \sum \exp(a)$. Looking just at the denominator above,  if we imagine having two contiguous chunks of key vectors, $K^1$ and $K^2$ and we compute the local softmax sums $L^1$ and $L^2$ for each
+
+$$L^1 = \sum_i \exp(Q \cdot K_i^1 - \max_j Q \cdot K_j^1)$$
+
+$$L^2 = \sum_i \exp(Q \cdot K_i^2 - \max_j Q \cdot K_j^2)$$
+
+Then we can combine these into the full softmax sum for these two chunks together by using
+
+\begin{align*}
+L^\text{combined} &= \exp(M^1 - \max(M^1, M^2)) \cdot L^1 \\
+&\quad + \exp(M^2 - \max(M^1, M^2)) \cdot L^2
+\end{align*}
+
+where
+
+$$M^1 = \max_j Q \cdot K_j^1 \text{ and } M^2 = \max_j Q \cdot K_j^2$$
+
+This can be done for the full softmax as well, giving us a way of accumulating arbitrarily large softmax sums. Here's the full algorithm from the Flash Attention paper.
+
+\begin{figure}[htb]
+\centering
+\includegraphics[width=\textwidth]{images/flash-algo.png}
+\caption{Flash Attention algorithm}
+\end{figure}
+
+From a hardware standpoint, this lets us fit our chunk of Q into VMEM (what the algorithm above calls on-chip SRAM) so we only have to load the KV chunks on each iteration, reducing the arithmetic intensity. We can also keep the running statistics in VMEM.
+
+One last subtle point worth emphasizing is an attention softmax property that's used to make the Flash VJP (reverse mode derivative) calculation practical for training.  If we define an intermediate softmax array as:
+
+$$S_{ij} = \frac{e^{\tau q_i \cdot k_j}}{\sum_k e^{\tau q_i \cdot k_j}}$$
+
+In attention, we obtain \textit{dS} from reverse-mode \textit{dO} and \textit{V} arrays:
+
+$$dS_{ij} = dO_{id} \cdot_d V_{jd} = \sum_d dO_{id} V_{jd}$$
+
+During the backpropagation of this gradient to Q and K
+
+$$d(q_i \cdot k_j) = (dS_{ij} - S_{ij} \cdot_j dS_{ij}) S_{ij}$$
+
+We exploit an identity that allows us to exchange a contraction along the large key \textbf{length} dimension with a local contraction along the feature \textbf{depth} dimension.
+
+\begin{align*}
+S_{ij} \cdot_j dS_{ij} &= \sum_j \frac{e^{\tau q_i \cdot k_j}}{\sum_k e^{\tau q_i \cdot k_k}} \sum_d dO_{id} V_{jd} \\
+&= \sum_d dO_{id} \sum_j \frac{e^{\tau q_i \cdot k_j}}{\sum_k e^{\tau q_i \cdot k_k}} V_{jd} \\
+&= \sum_d dO_{id} O_{id} \\
+&= dO_{id} \cdot_d O_{id}
+\end{align*}
+
+This replacement is crucial for being able to implement a sequence-block \textit{local} calculation for the VJP, and enables further clever sharding schemes like ring attention.

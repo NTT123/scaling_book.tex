@@ -1,0 +1,61 @@
+\section{What Do We Mean By Scaling?}
+
+The goal of ``model scaling'' is to be able to increase the number of chips used for training or inference while achieving a proportional, linear increase in throughput (we call this \textit{strong scaling}). While performance on a single chip depends on the trade-off between memory bandwidth and FLOPs, performance at the cluster level depends on hiding inter-chip communication by overlapping it with useful FLOPS. This is non-trivial, because increasing the number of chips increases the communication load while reducing the amount of per-device computation we can use to hide it. As we saw in Section 3,~ sharded matrix multiplications often require expensive AllGathers or ReduceScatters that can block the TPUs from doing useful work. The goal of this section is to find out when these become \textit{too expensive.}
+
+In this section, we'll discuss four common parallelism schemes: (pure) \textbf{data parallelism, fully-sharded data parallelism} (FSDP / ZeRO sharding), \textbf{tensor parallelism} (also known as model parallelism), and (briefly) \textbf{pipeline parallelism}. For each, we'll show what communication cost we incur and at what point that cost starts to bottleneck our compute cost.\footnote{We'll focus on communication bounds --- since while memory capacity constraints are important, they typically do not bound us when using rematerialization (activation checkpointing) and a very large number of chips during pre-training. We also do not discuss expert parallelism here for MoEs --- which expands the design space substantially, only the base case of a dense Transformer.} For this section, you can focus solely on inter-chip communication costs, since as long as we have a large enough single-chip batch size, the transfer of data from HBM to MXU is already overlapped with computation.
+
+We'll use the following notation to simplify calculations throughout this section.
+
+{\footnotesize
+\setlength{\tabcolsep}{3pt}
+\begin{longtable}{p{1.5cm}p{6cm}}
+\toprule
+\textbf{Notation} & \textbf{Meaning (model parameters)} \\
+\midrule
+D & $d_{\text{model}}$ (the hidden dimension/residual stream dim) \\
+F & $d_{\text{ff}}$ (the feed-forward dimension) \\
+B & Batch dimension (number of tokens in the batch; total, not per-device) \\
+T & Sequence length \\
+L & Number of layers in the model \\
+\bottomrule
+\end{longtable}
+}
+
+{\footnotesize
+\setlength{\tabcolsep}{3pt}
+\begin{longtable}{p{1.5cm}p{6cm}}
+\toprule
+\textbf{Notation} & \textbf{Meaning (hardware characteristic)} \\
+\midrule
+C & FLOPS/s per chip \\
+W & Network bandwidth (bidirectional, often subscripted as  e.g. $W_{\text{ici}}$ or $W_{\text{dcn}}$ \\
+X & Number of chips along mesh axis X \\
+Y & Number of chips along an alternate mesh axis, labeled Y \\
+Z & Number of chips along a third mesh axis, labeled Z \\
+\bottomrule
+\end{longtable}
+}
+
+For simplicity's sake, \textbf{we'll approximate a Transformer as a stack of MLP blocks} --- attention is a comparatively small fraction of the FLOPs for larger models as we saw in Section 4.~ We will also ignore the gating matmul, leaving us with the following simple structure for each layer:
+
+\begin{figure}[htb]
+\centering
+\includegraphics[width=\textwidth]{images/transformer-layer.png}
+\caption{A simplified Transformer layer. We treat each FFW block as a stack of two matrices $\textbf{W}_{\text{in}}$: \texttt{bf16[D, F]} (up-projection) and $\textbf{W}_{\text{out}}$: \texttt{bf16[F, D]} (down-projection) with an input $\textbf{In}$: \texttt{bf16[B, D]}.}
+\end{figure}
+
+Here are the 4 parallelism schemes we will discuss. Each scheme can be thought of as uniquely defined by a sharding for $\textbf{In}$, $\textbf{W}_{\text{in}}$, $\textbf{W}_{\text{out}}$, and $\textbf{Out}$ in the above diagram.
+
+\textbf{1. Data parallelism:} activations sharded along batch, parameters and optimizer state are replicated on each device. Communication only occurs during the backwards pass.
+
+$$\text{In}[B_X, D] \cdot_D W_\text{in}[D, F] \cdot_F W_\text{out}[F, D] \rightarrow \text{Out}[B_X, D]$$
+
+\textbf{2. Fully-sharded data parallelism (FSDP or ZeRO-3):} activations sharded along batch (like pure data parallelism), parameters sharded along same mesh axis and AllGathered just-in-time before use in forward pass. Optimizer state also sharded along batch. Reduces duplicated memory.
+
+$$\text{In}[B_X, D] \cdot_D W_\text{in}[D_X, F] \cdot_F W_\text{out}[F, D_X] \rightarrow \text{Out}[B_X, D]$$
+
+\textbf{3. Tensor parallelism (also called Megatron sharding or model parallelism):} activations sharded along D ($d_\text{model}$),~ parameters sharded along F ($d_{ff}$).~ AllGather and ReduceScatter activations before and after each block. Compatible with FSDP.
+
+$$\text{In}[B, D_Y] \cdot_D W_\text{in}[D, F_Y] \cdot_F W_\text{out}[F_Y, D] \rightarrow \text{Out}[B, D_Y]$$
+
+\textbf{4. Pipeline parallelism:} weights sharded along the layer dimension, activations microbatched and rolled along the layer dimension. Communication between pipeline stages is minimal (just moving activations over a single hop). To abuse notation: $\text{In}[L_Z, B, D][i] \cdot_D W_\text{in}[L_Z, D, F][i] \cdot_F W_\text{out}[L_Z, F, D][i] \rightarrow \text{Out}[L_Z, B, D][i]$

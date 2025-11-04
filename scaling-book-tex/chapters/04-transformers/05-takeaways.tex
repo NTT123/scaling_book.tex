@@ -1,0 +1,28 @@
+\section{What Should You Take Away from this Section?}
+
+\begin{itemize}
+\item The overall parameters and FLOPs of a Transformer are fairly easy to calculate, and are summarized here, assuming MHA (with batch size B, vocab size V, a sequence of length T, D=$d_{\text{model}}$, and F=$d_{\text{ff}}$):
+\end{itemize}
+
+{\scriptsize
+\setlength{\tabcolsep}{3pt}
+\begin{table}[h]
+\centering
+\begin{tabular}{p{2cm}p{2.8cm}p{3.2cm}}
+\toprule
+\textbf{Component} & \textbf{Params per layer} & \textbf{Training FLOPs per layer} \\
+\midrule
+\textbf{MLP} & 3DF & 18BTDF \\
+\textbf{Attention} & 4DNH & 24BTDNH + 12BT$^2$NH \\
+\textbf{Other} & D & BTD \\
+\textbf{Vocab} & DV (total, not per-layer) & 12BTDV \\
+\bottomrule
+\end{tabular}
+\end{table}
+}
+
+\begin{itemize}
+\item The parameter count of the MLP block dominates the total parameter count and the MLP block also dominates the FLOPs budget as long as the sequence length $T < 8D$.
+\item The total FLOPs budget during training is well approximated by $6 \cdot \text{num\_params} \cdot \text{num\_tokens}$ for reasonable context lengths.
+\item During inference, our KV caches are roughly $2 \cdot S \cdot L \cdot N \cdot H$ per cache, although architectural modifications can often reduce this.
+\end{itemize}

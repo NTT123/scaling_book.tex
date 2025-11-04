@@ -1,0 +1,15 @@
+\section{Transformer Accounting}
+
+Transformers are the future. Well, they're the present at least. Maybe a few years ago, they were one of many architectures. But today, it's worth knowing pretty much every detail of the architecture. We won't reintroduce the architecture but \href{https://jalammar.github.io/illustrated-transformer/}{this blog} and the \href{https://arxiv.org/abs/1706.03762}{original Transformer paper} may be helpful references.
+
+Here's a basic diagram of the Transformer decoder architecture:
+
+\begin{figure}[htb]
+\centering
+\includegraphics[width=\textwidth]{images/transformer-diagram.png}
+\caption{This diagram shows one layer of a standard Transformer and flows from top-to-bottom. We use a single-letter convention to describe the shapes and layouts of arrays in a Transformer, again showing contracting dimensions in red, and batched dimensions in blue. In a given operation, the input shape is given on top-left and the parameter shape is given on the top-right, with the resulting shape below, e.g. BTD is the input shape for the gating einsum and DF is the weight shape.}
+\end{figure}
+
+\textbf{Note [gating einsum]}: The diagram above uses a ``\href{https://arxiv.org/abs/2002.05202}{gating einsums}''~\cite{glu} where we split the up-projection matrix into two matrices ($W_\text{In1}$ and $W_\text{In2}$ above) whose outputs are elementwise multiplied as a kind of ``gating function''. Not all LLMs use this, so you will sometimes see a single $W_\text{In}$ matrix and a total MLP parameter count of 2DF instead of 3DF. Typically in this case, D and F will be scaled up to keep the parameter count the same as the 3 matrix case. With that said, some form of gating einsum is used by LLAMA, DeepSeek, and many other models.
+
+\textbf{Note 2 [MHA attention]}: With self-attention, T and S are the same but for cross-attention they may be different. With vanilla Multi-Head Attention (MHA), N and K are the same while for \href{https://arxiv.org/abs/1911.02150}{Multi-Query Attention} (MQA)~\cite{mqa} K=1 and for \href{https://arxiv.org/abs/2305.13245}{Grouped MQA} (GMQA)~\cite{gmqa} K merely has to divide N.

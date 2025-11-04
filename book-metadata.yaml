@@ -1,0 +1,19 @@
+---
+title: "How to Scale Your Model: A Systems View of LLMs on TPUs"
+author:
+  - Jacob Austin
+  - Sholto Douglas
+  - Roy Frostig
+  - Anselm Levskaya
+  - Charlie Chen
+  - Sharad Vikram
+  - Federico Lebron
+  - Peter Choy
+  - Vinay Ramasesh
+  - Albert Webson
+date: 2025
+toc: true
+toc-depth: 2
+biblatex: true
+bibliography: scaling-book/assets/bibliography/main.bib
+---

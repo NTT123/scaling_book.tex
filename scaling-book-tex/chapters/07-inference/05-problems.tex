@@ -1,0 +1,101 @@
+\section{Worked Problems}
+
+I'm going to invent a new model based on LLaMA-2 13B for this section. Here are the details:
+
+{\scriptsize
+\setlength{\tabcolsep}{2pt}
+\begin{longtable}{p{5cm}p{2.5cm}}
+\hline
+hyperparam & value \\
+\hline
+L (num\_layers) & 64 \\
+D (d\_model) & 4,096 \\
+F (ffw\_dimension) & 16,384 \\
+N (num\_heads) & 32 \\
+K (num\_kv\_heads) & 8 \\
+H (qkv\_dim) & 256 \\
+V (num\_embeddings) & 32,128 \\
+\hline
+\end{longtable}
+}
+
+\textbf{Question 1:} How many parameters does the above model have? How large are its KV caches per token in int8? \textit{You can assume we share the input and output projection matrices.}
+
+
+
+\textbf{Question 2:} Say we want to serve this model on a TPUv5e 4x4 slice and can fully shard our KV cache over this topology. What's the largest batch size we can fit, assuming we use int8 for everything and want to support 128k sequences? What if we dropped the number of KV heads to 1?
+
+
+
+\textbf{Question 3:} How long does it take to load all the parameters into the MXU from HBM assuming they're fully sharded on a TPU v5e 4x4 slice? Assume int8 parameters. \textit{This is a good lower bound on the per-step latency.}
+
+
+
+\textbf{Question 4:} Let's say we want to serve this model on a TPUv5e 4x4 slice using int8 FLOPs and parameters/activations. How would we shard it for both prefill and decode? \textit{Hint: maybe answer these questions first:}
+
+\begin{enumerate}
+\item What does ICI look like on a 4x4?
+\item What's the roofline bound on tensor parallelism?
+\item How can we shard the KV caches?
+\end{enumerate}
+
+For this sharding, what is the rough per-step latency for generation?
+
+\textbf{Question 5:} Let's pretend the above model is actually an MoE. An MoE model is effectively a dense model with E copies of the FFW block. Each token passes through k of the FFW blocks and these \texttt{k} are averaged to produce the output. Let's use \texttt{E=16} and \texttt{k=2} with the above settings.
+
+\begin{enumerate}
+\item How many total and activated parameters does it have? \textit{Activated means used by any given token.}
+\item What batch size is needed to become FLOPs bound on TPU v5e?
+\item How large are its KV caches per token?
+\item How many FLOPs are involved in a forward pass with T tokens?
+\end{enumerate}
+
+
+
+\textbf{Question 6:} With MoEs, we can do ``expert sharding'', where we split our experts across one axis of our mesh. In our standard notation, our first FFW weight has shape \texttt{[E, D, F]} and we shard it as [E$_Z$, D$_X$, F$_Y$] where \texttt{X} is only used during training as our FSDP dimension. Let's say we want to do inference on a TPU v5e:
+
+\begin{enumerate}
+\item What's the HBM weight loading time for the above model on a TPU v5e 8x16 slice with Y=8, Z=16? How much free HBM is available per TPU?
+\item What is the smallest slice we could fit our model on?
+\end{enumerate}
+
+\textbf{Question 7 [2D model sharding]:} Here we'll work through the math of what the \href{https://arxiv.org/pdf/2211.05102}{ESTI paper} calls 2D weight-stationary sharding. We describe this briefly in Appendix B, but try doing this problem first to see if you can work out the math. The basic idea of 2D weight stationary sharding is to shard our weights along both the $D$ and $F$ axes so that each chunk is roughly square. This reduces the comms load and allows us to scale slightly farther.
+
+Here's the algorithm for 2D weight stationary:
+
+\begin{enumerate}
+\item In[B, D$_X$] = \textbf{AllGather}$_{YZ}$(In[B, D$_{XYZ}$])
+\item Tmp[B, F$_{YZ}$] \{U.X\} = In[B, D$_X$] *$_D$ W$_{\text{in}}$[D$_X$, F$_{YZ}$]
+\item Tmp[B, F$_{YZ}$] = \textbf{AllReduce}$_X$(Tmp[B, F$_{YZ}$] \{U.X\})
+\item Out[B, D$_X$] \{U.YZ\} = Tmp[B, F$_{YZ}$] *$_F$ W2[F$_{YZ}$, D$_X$]
+\item Out[B, D$_{XYZ}$] = \textbf{ReduceScatter}$_{YZ}$(Out[B, D$_X$] \{U.YZ\})
+\end{enumerate}
+
+Your goal is to work out $T_\text{math}$ and $T_\text{comms}$ for this algorithm and find when it will outperform traditional 3D model sharding?
+
+Let's work out $T_\text{math}$ and $T_\text{comms}$ All our FLOPs are fully sharded so as before we have $T_\text{math} = 4BDF / (N \cdot C)$ but our comms are now
+
+\begin{align*}
+T_\text{2D comms} &= \frac{2BD}{2X \cdot W_\text{ici}} + \frac{4BF}{YZ \cdot W_\text{ici}} + \frac{2BD}{2X \cdot W_\text{ici}} \\
+&= \frac{2BD}{X \cdot W_\text{ici}} + \frac{4BF}{YZ \cdot W_\text{ici}}
+\end{align*}
+
+where we note that the AllReduce is twice as expensive and we scale our comms by the number of axes over which each operation is performed. Assuming we have freedom to choose our topology and assuming $F=4D$ (as in LLaMA-2), we claim (by some basic calculus) that the optimal values for $X$, $Y$, and $Z$ are $X = \sqrt{N / 8}$, $YZ = \sqrt{8N}$ so the total communication is
+
+\begin{align*}
+T_\text{2D comms} &= \frac{2B}{W_\text{ici}} \left(\frac{D}{X} + \frac{8D}{YZ}\right) \\
+&= \frac{\sqrt{128} BD}{\sqrt{N} \cdot W_\text{ici}} \approx \frac{11.3 BD}{\sqrt{N} \cdot W_\text{ici}}
+\end{align*}
+
+Firstly, copying from above, normal 1D model parallelism would have $T_\text{model parallel comms} = 4BD / (3 \cdot W_\text{ici})$, so when are the new comms smaller? We have
+
+\begin{align*}
+T_\text{model parallel comms} > T_\text{2D comms} &\iff \frac{4BD}{3 \cdot W_\text{ici}} > \frac{\sqrt{128} BD}{\sqrt{N} \cdot W_\text{ici}} \\
+&\iff N > 128 \cdot \left(\frac{3}{4}\right)^2 = 81
+\end{align*}
+
+For a general $F$, we claim this condition is
+
+$$N > 32 \cdot \left(\frac{F}{D}\right) \cdot \left(\frac{3}{4}\right)^2$$
+
+So that tells us if we have more than 81 chips, we're better off using this new scheme. Now this is a slightly weird result because we've historically found ourselves ICI bound at around \textasciitilde 20 way tensor parallelism. But here, even if we're communication-bound, our total communication continues to decrease with the number of total chips! What this tells us is that we can continuous to increase our chips, increase our batch size, do more parameter scaling, and see reduced latency.

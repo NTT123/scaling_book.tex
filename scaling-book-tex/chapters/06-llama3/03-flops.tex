@@ -1,0 +1,7 @@
+Let's look at FLOPs now! \textit{Remember the general rules for training from Section~\ref{chap:transformers}.}
+
+\textbf{Question:} How many FLOPs does LLaMA-3 perform per token per training step? \textit{This helps us determine how expensive the whole training process will be.}
+
+\textbf{Question:} LLaMA 3 was trained for about 15 trillion tokens. How many FLOPs is that total?
+
+\textbf{Question:} Let's say we wanted to train on a full TPU v5p pod with 16x20x28 = 8960 chips. How long would this take to train at 40\% MFU in bfloat16, assuming we are compute-bound?

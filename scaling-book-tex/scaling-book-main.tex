@@ -1,0 +1,262 @@
+% Pandoc LaTeX template for B6 two-sided book
+\documentclass[10pt,twoside]{book}
+
+% Font setup - New Computer Modern
+\usepackage{fontsetup}
+
+% B6 paper size with two-sided margins
+% Using tighter margins to accommodate wide tables and math
+\usepackage[
+    b6paper,
+    inner=1.6cm,      % Binding side margin (more space for binding)
+    outer=0.8cm,    % Outer edge margin (reduced for more text width)
+    top=0cm,        % No top margin for maximum content space
+    bottom=0.4cm,   % Minimal bottom margin for page numbers
+    includeheadfoot
+]{geometry}
+
+% Allow some text to extend into margins if needed for math overflow
+\setlength{\emergencystretch}{3em}
+\setlength{\hfuzz}{0.5pt}
+
+% Essential packages
+\usepackage{amsmath,amssymb}
+
+% Allow breaking of long equations across lines and pages
+\allowdisplaybreaks
+
+% Allow more flexible math spacing to prevent overflow
+\binoppenalty=100
+\relpenalty=100
+
+% Make math environments more tolerant of tight spaces
+\setlength{\mathsurround}{0pt}
+
+% Use slightly smaller font for math if needed
+\DeclareMathSizes{10}{10}{7}{5}
+
+\usepackage{graphicx}
+
+% Set maximum image dimensions to fit within text area
+\setkeys{Gin}{width=\linewidth,height=0.8\textheight,keepaspectratio}
+
+\usepackage{longtable,booktabs}
+\usepackage{calc} % for calculating minipage widths
+\usepackage{microtype}
+
+% Better table handling for small pages
+\usepackage{adjustbox}
+\usepackage{etoolbox}
+\usepackage{pdflscape}  % For landscape pages
+\usepackage{rotating}   % For rotating tables without rotating pages
+
+% Make tables use small font and tighter spacing to fit B6 pages
+% Only apply to longtable (content tables), not tabular (which includes title page author list)
+\AtBeginEnvironment{longtable}{\scriptsize\setlength{\tabcolsep}{2.5pt}}
+
+% Code highlighting - Define pandoc syntax highlighting colors and commands
+\usepackage{xcolor}
+\usepackage{fancyvrb}
+
+% Define colors for syntax highlighting
+\definecolor{shadecolor}{RGB}{248,248,248}
+\definecolor{keywordcolor}{RGB}{0,0,255}
+\definecolor{stringcolor}{RGB}{163,21,21}
+\definecolor{commentcolor}{RGB}{0,128,0}
+\definecolor{numbercolor}{RGB}{9,134,88}
+\definecolor{operatorcolor}{RGB}{102,102,102}
+
+% Define Shaded environment for code blocks
+\newenvironment{Shaded}{%
+  \begin{snugshade}%
+  \footnotesize%
+}{%
+  \end{snugshade}%
+}
+
+% Define snugshade environment
+\makeatletter
+\newenvironment{snugshade}{%
+  \def\FrameCommand##1{\hskip\@totalleftmargin
+    \colorbox{shadecolor}{##1}%
+    \hskip-\linewidth \hskip-\@totalleftmargin \hskip\columnwidth}%
+  \MakeFramed {\advance\hsize-\width
+    \@totalleftmargin\z@ \linewidth\hsize
+    \@setminipage}}%
+{\par\unskip\endMakeFramed}
+\makeatother
+
+\usepackage{framed}
+
+% Define Highlighting environment with line wrapping
+% Using scriptsize for better fit on B6 pages
+\DefineVerbatimEnvironment{Highlighting}{Verbatim}{commandchars=\\\{\},fontsize=\scriptsize}
+
+% Define all syntax highlighting token commands
+\newcommand{\AlertTok}[1]{\textcolor{red}{\textbf{#1}}}
+\newcommand{\AnnotationTok}[1]{\textcolor{commentcolor}{\textit{#1}}}
+\newcommand{\AttributeTok}[1]{\textcolor{numbercolor}{#1}}
+\newcommand{\BaseNTok}[1]{\textcolor{numbercolor}{#1}}
+\newcommand{\BuiltInTok}[1]{\textcolor{keywordcolor}{#1}}
+\newcommand{\CharTok}[1]{\textcolor{stringcolor}{#1}}
+\newcommand{\CommentTok}[1]{\textcolor{commentcolor}{\textit{#1}}}
+\newcommand{\CommentVarTok}[1]{\textcolor{commentcolor}{\textit{#1}}}
+\newcommand{\ConstantTok}[1]{\textcolor{numbercolor}{#1}}
+\newcommand{\ControlFlowTok}[1]{\textcolor{keywordcolor}{\textbf{#1}}}
+\newcommand{\DataTypeTok}[1]{\textcolor{keywordcolor}{#1}}
+\newcommand{\DecValTok}[1]{\textcolor{numbercolor}{#1}}
+\newcommand{\DocumentationTok}[1]{\textcolor{commentcolor}{\textit{#1}}}
+\newcommand{\ErrorTok}[1]{\textcolor{red}{\textbf{#1}}}
+\newcommand{\ExtensionTok}[1]{#1}
+\newcommand{\FloatTok}[1]{\textcolor{numbercolor}{#1}}
+\newcommand{\FunctionTok}[1]{\textcolor{blue}{#1}}
+\newcommand{\ImportTok}[1]{\textcolor{keywordcolor}{\textbf{#1}}}
+\newcommand{\InformationTok}[1]{\textcolor{commentcolor}{\textit{#1}}}
+\newcommand{\KeywordTok}[1]{\textcolor{keywordcolor}{\textbf{#1}}}
+\newcommand{\NormalTok}[1]{#1}
+\newcommand{\OperatorTok}[1]{\textcolor{operatorcolor}{#1}}
+\newcommand{\OtherTok}[1]{\textcolor{numbercolor}{#1}}
+\newcommand{\PreprocessorTok}[1]{\textcolor{keywordcolor}{#1}}
+\newcommand{\RegionMarkerTok}[1]{#1}
+\newcommand{\SpecialCharTok}[1]{\textcolor{stringcolor}{#1}}
+\newcommand{\SpecialStringTok}[1]{\textcolor{stringcolor}{#1}}
+\newcommand{\StringTok}[1]{\textcolor{stringcolor}{#1}}
+\newcommand{\VariableTok}[1]{\textcolor{blue}{#1}}
+\newcommand{\VerbatimStringTok}[1]{\textcolor{stringcolor}{#1}}
+\newcommand{\WarningTok}[1]{\textcolor{red}{\textit{#1}}}
+
+% Hyperref for cross-references
+\usepackage[
+    colorlinks=true,
+    linkcolor=blue!70!black,
+    citecolor=green!60!black,
+    urlcolor=blue!70!black,
+    bookmarks=true
+]{hyperref}
+
+% Bibliography support
+\usepackage[authoryear]{natbib}
+\bibliographystyle{plainnat}
+
+% Custom environment for takeaway boxes
+\usepackage[most]{tcolorbox}
+\newtcolorbox{takeawaybox}{
+    colback=blue!5!white,
+    colframe=blue!75!black,
+    fonttitle=\bfseries,
+    title=Key Takeaway,
+    breakable,
+    before skip=\baselineskip,
+    after skip=\baselineskip
+}
+
+% Custom environment for algorithm boxes
+\newtcolorbox{algorithmbox}{
+    colback=gray!5!white,
+    colframe=black!75,
+    fonttitle=\bfseries,
+    title=Algorithm,
+    breakable,
+    before skip=\baselineskip,
+    after skip=\baselineskip
+}
+
+% Pandoc custom div support
+\newenvironment{takeaway}{\begin{takeawaybox}}{\end{takeawaybox}}
+
+% Chapter and section formatting
+\usepackage{titlesec}
+\titleformat{\chapter}[display]
+  {\normalfont\huge\bfseries}{\chaptertitlename\ \thechapter}{20pt}{\Huge}
+\titlespacing*{\chapter}{0pt}{-20pt}{40pt}
+
+% Page headers and footers - simple page numbers in footer only
+\usepackage{fancyhdr}
+\pagestyle{fancy}
+\fancyhf{} % Clear all headers and footers
+\fancyfoot[C]{\thepage} % Center page number in footer
+\renewcommand{\headrulewidth}{0pt} % Remove header line
+\renewcommand{\footrulewidth}{0pt} % No footer line
+
+% Make sure figures don't float too far
+\usepackage{float}
+\let\origfigure\figure
+\let\endorigfigure\endfigure
+\renewenvironment{figure}[1][]{%
+  \origfigure[H]
+}{%
+  \endorigfigure
+}
+
+% Adjust figure and table captions
+\usepackage[font=small,labelfont=bf]{caption}
+
+% Handle pandoc's tight lists
+\providecommand{\tightlist}{%
+  \setlength{\itemsep}{0pt}\setlength{\parskip}{0pt}}
+
+% Title and author information
+\title{How to Scale Your Model\\[0.5em]
+\large A Systems View of LLMs on TPUs}
+
+\author{
+Jacob Austin\\
+Sholto Douglas\\
+Roy Frostig\\
+Anselm Levskaya\\
+Charlie Chen\\
+Sharad Vikram\\
+Federico Lebron\\
+Peter Choy\\
+Vinay Ramasesh\\
+Albert Webson\\
+Reiner Pope\textsuperscript{*}\\[1em]
+\textit{Google DeepMind}
+}
+
+\date{February 4, 2025}
+
+\begin{document}
+
+% Use sloppy formatting to prevent overflow (allows more spacing)
+\sloppy
+
+% Temporarily use centered geometry for title page
+\newgeometry{
+    b6paper,
+    left=1.4cm,     % Equal margins on both sides for centered title
+    right=1.4cm,
+    top=0cm,
+    bottom=0.3cm,
+    includeheadfoot
+}
+\maketitle
+% Restore two-sided margins for content
+\thispagestyle{empty}
+\restoregeometry
+
+\newpage
+\thispagestyle{empty}
+\ % The empty page
+\newpage
+\thispagestyle{empty}
+\ % The empty page
+\thispagestyle{empty}
+% Table of contents
+% \tableofcontents
+\thispagestyle{empty}
+
+% Main content - chapters
+\input{chapters/00-introduction}
+\input{chapters/01-roofline}
+\input{chapters/02-tpus}
+\input{chapters/03-sharding}
+\input{chapters/04-transformers}
+\input{chapters/05-training}
+\input{chapters/06-llama3}
+\input{chapters/07-inference}
+
+% Bibliography
+\bibliography{main}
+
+\end{document}

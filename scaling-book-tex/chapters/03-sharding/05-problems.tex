@@ -1,0 +1,59 @@
+\section*{Some Problems to Work}
+\addcontentsline{toc}{section}{Some Problems to Work}
+
+\textit{Here are some instructive problems based on content in this section. We won't include all answers at the moment but we'll write up more answers as we can.}
+
+\textbf{Question 1 [replicated sharding]:} An array is sharded $A[I_X, J, K, \ldots]$ (i.e., only sharded across $X$), with a mesh \texttt{Mesh(\{'X': 4, 'Y': 8, 'Z': 2\})}. What is the ratio of the total number of bytes taken up by $A$ across all chips to the size of one copy of the array?
+
+\textbf{Question 2 [AllGather latency]:} How long should $\text{AllGather}_X([B_X, D_Y])$ take on a TPUv4p 4x4x4 slice with mesh \texttt{Mesh(\{'X': 4, 'Y': 4, 'Z': 4\})} if $B=1024$ and $D=4096$ in bfloat16? How about $\text{AllGather}_{XY}([B_X, D_Y])$? How about $\text{AllReduce}_Z([B_X, D_Y] \{U_Z \})$?
+
+\begin{enumerate}
+\item Because we're just gathering over one axis and the other is sharded, we're effectively gathering $2BD / Y$ bytes over 1 axis. \textit{If you think about just a single shard along the Y-axis, the AllGather along X looks like an unsharded AllGather with 1 / Y of the bytes.} Since our ICI bandwidth for TPU v4p is 9e10 bytes/second bidirectional, this will take $2BD / (\text{9e10} \cdot Y) = 2 \cdot 1024 \cdot 4096 / (\text{9e10} \cdot 4) = 23 \mu s$.
+
+\item We have twice the bandwidth as before but we're AllGathering the full array, so \texttt{T = 2BD / (2 * W) = 2*1024*4096 / (2 * 9e10) = 46us}. This is far from the latency bound of 4us (1us per hop), so we're fine.
+
+\item The cost of an AllReduce is twice that of an AllGather. Each shard has size $2BD / (X * Y)$, so the cost is about $4BD / (X * Y * W)$, or roughly \texttt{4 * 1024 * 4096 / (16 * 9e10) = 11.6us}.
+\end{enumerate}
+
+\textbf{Question 3 [latency-bound AllGather]:} Let's say we're performing an $\text{AllGather}_X([B_X])$ but $B$ is very small (say 128). How long should this take on a TPUv4p 4x4x4 slice with mesh \texttt{Mesh(\{'X': 4, 'Y': 4, 'Z': 4\})} in bfloat16? \textit{Hint: you're probably latency bound.}
+
+\textbf{Question 4 [matmul strategies]:} To perform $X[B, D] \cdot_D Y[D_X, F] \to Z[B, F]$, in this section we tell you to perform $\text{AllGather}_X(Y[D_X, F])$ and multiply the fully replicated matrices (Case 2, \textit{Strategy 1}). Instead, you could multiply the local shards like $X[B, D_X] \cdot_D Y[D_X, F] \to Z[B, F] \{U_X\}$ (Case 4, \textit{Strategy 2}), and then $\text{AllReduce}_X(Z[B, F] \{ U_X\})$. How many FLOPs and comms does each of these perform? Which is better and why?
+
+\textbf{Question 5 [minimum latency]:} Let's say I want to do a matmul $A[I, J] \cdot_J B[J, K] \to C[I, K]$ on a TPUv5p 4x4x4 with the lowest possible latency. Assume the inputs can be sharded arbitrarily but the result should be fully replicated. How should my inputs be sharded? What is the total FLOPs and comms time?
+
+\textbf{Question 6:} Let's say we want to perform $A[I_X, J_Y] \cdot_J B[J_Y, K] \to C[I_X, K]$ on TPUv5e 4x4. What communication do we perform? How much time is spent on communication vs. computation?
+
+\begin{itemize}
+\item What about $A[I_X, J] \cdot_J B[J_X, K_Y] \to C[I_X, K_Y]$? This is the most standard setting for training where we combine data, tensor, and zero sharding.
+\item What about $A[I_X, J] \cdot_J B[J, K_Y] \to C[I_X, K_Y]$? This is standard for inference, where we do pure tensor parallelism (+data).
+\end{itemize}
+
+\textbf{Question 7:} A typical Transformer block has two matrices $B[D, F]$ and $C[F, D]$ where $F \gg D$. With a batch size B, the whole block is $C \cdot B \cdot x$ with $x[B, D]$. Let's pick $D=8192$, $F=32768$, and $B=128$ and assume everything is in bfloat16. Assume we're running on a TPUv5e 2x2 slice but assume each TPU only has 300MB of free memory. How should \textbf{B, C, and the output be sharded to stay below the memory limit while minimizing overall time? How much time is spent on comms and FLOPs?}
+
+\textbf{Question 8 [challenge]:} Using the short code snippet above as a template, allocate a sharded array and benchmark each of the 4 main communication primitives (AllGather, AllReduce, ReduceScatter, and AllToAll) using pmap or shard\_map. You will want to use \texttt{jax.lax.all\_gather}, \texttt{jax.lax.psum}, \texttt{jax.lax.psum\_scatter}, and \texttt{jax.lax.all\_to\_all}. Do you understand the semantics of these functions? How long do they take?
+
+\textbf{Question 9 [another strategy for sharded matmuls?]:} Above we claimed that when only one input to a matmul is sharded along its contracting dimension, we should AllGather the sharded matrix and perform the resulting contracting locally. Another strategy you might think of is to perform the sharded matmul and then AllReduce the result (as if both inputs were sharded along the contracting dimension), i.e. $A[I, J_X] *_J B[J, K] \to C[I, K]$ by way of
+
+\begin{enumerate}
+\item $C[I, K] \{ U_X \} = A[I, J_X] \cdot B[J_X, K]$
+\item $C[I, K] = \text{AllReduce}(C[I, K] \{ U_X\})$
+\end{enumerate}
+
+Answer the following:
+
+\begin{enumerate}
+\item Explicitly write out this algorithm for matrices $A[N, M]$ and $B[M, K]$, using indices to show exactly what computation is done on what device. Assume $A$ is sharded as $A[I, J_X]$ across ND devices, and you want your output to be replicated across all devices.
+\item Now suppose you are ok with the final result not being replicated on each device, but instead sharded (across either the N or K dimension). How would the algorithm above change?
+\item Looking purely at the communication cost of the strategy above (in part (b), not (a)), how does this communication cost compare to the communication cost of the algorithm in which we first AllGather A and then do the matmul?
+\end{enumerate}
+
+\textbf{Question 10: Fun with AllToAll:} In the table above, it was noted that the time to perform an AllToAll is a factor of 4 lower than the time to perform an AllGather or ReduceScatter (in the regime where we are throughput-bound). In this problem we will see where that factor of 4 comes from, and also see how this factor would change if we only had single-direction ICI links, rather than bidirectional ICI links.
+
+\begin{enumerate}
+\item Let's start with the single-direction case first. Imagine we have \textit{D} devices in a ring topology, and If we are doing either an AllGather or a ReduceScatter, on an N x N matrix \textit{A} which is sharded as $A[I_X, J]$ (say $D$ divides $N$ for simplicity). Describe the comms involved in these two collectives, and calculate the total number of scalars (floats or ints) which are transferred across \textbf{a single} ICI link during the entirety of this algorithm.
+\item Now let's think about an AllToAll, still in the single-directional ICI case. How is the algorithm different in this case than the all-gather case? Calculate the number of scalars that are transferred across a single ICI link in this algorithm.
+\item You should have found that the ratio between your answers to part (a) and part (b) is a nice number. Explain where this factor comes from in simple terms.
+\item Now let's add bidirectional communication. How does this affect the total time needed in the all-gather case?
+\item How does adding bidirectional communication affect the total time needed in the AllToAll case?
+\item Now simply explain the ratio between AllGather time and AllToAll time in a bidirectional ring.
+\end{enumerate}

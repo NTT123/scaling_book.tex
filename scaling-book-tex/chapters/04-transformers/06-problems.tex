@@ -1,0 +1,17 @@
+\section{A Few Problems to Work}
+
+\textbf{Question 1:} How many parameters does a model with $D=4096$, $F=4 \cdot D$, $V=32,000$, and $L=64$ have? What fraction of these are attention parameters? How large are our KV caches per token? \textit{You can assume $N\cdot H=D$ and multi-head attention with int8 KVs.}
+
+\textbf{Question 2:} How many total FLOPs are required to perform A[B$_X$, D$_Y$] *$_D$ W[D$_Y$, F] on \texttt{\{'X': 4, 'Y': 8, 'Z': 4\}}. How many FLOPs are performed by each TPU?
+
+\textbf{Question 3:} How many FLOPs are involved in performing $A[I,J,K,L] * B[I,J,M,N,O] \rightarrow C[K,L,M,N,O]$?
+
+\textbf{Question 4:} What is the arithmetic intensity of self-attention (ignoring the Q/K/V/O projections)? \textit{Give the answer as a function of the Q and KV lengths T and S.} At what context length is attention FLOPs-bound? Given the HBM bandwidth of our TPUs, plot the effective relative cost of attention to the FFW block as the context length grows.
+
+\textbf{Question 5:} At what sequence length are self-attention FLOPs equal to the QKVO projection FLOPs?
+
+\textbf{Question 6:} Say we only save the output of each of the 7 main matmuls in a Transformer layer during our forward pass (Q, K, V, O + the three FFW matrices). How many extra FLOPs do we need to ``rematerialize'' during the backwards pass?
+
+\textbf{Question 7:} DeepSeek v3 says it was trained for 2.79M H800 hours on 14.8T tokens (source). Given that it has 37B activated parameters, roughly what hardware utilization did they achieve? \textit{Hint: note that they used FP8 FLOPs without structured sparsity.}
+
+\textbf{Question 8:} Mixture of Experts (MoE) models have $E$ copies of a standard dense MLP block, and each token activates $k$ of these experts. What batch size in tokens is required to be compute-bound for an MoE with weights in int8 on TPU v5e? For DeepSeek, which has 256 (routed) experts and $k=8$, what is this number?

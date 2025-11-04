@@ -1,0 +1,10 @@
+\section{How to shard LLaMA 3-70B for training}
+
+Let's stick to our setting from above and say we want to train LLaMA 3-70B with 4M token batch size (1024 sequences of length 4096 per batch) on a TPU v5p pod of 8960 chips. Let's discuss what the best sharding strategy is for this model.
+
+\textbf{Question:} Under the assumptions above, can we train our model with FSDP alone? To start, let's say we can't do any sequence/context parallelism. \textit{This should be the first idea you have, since it's simple and will introduce no extra communication if it works.}
+\textbf{Question:} Let's relax the requirement of not doing any sequence sharding. If we allow ourselves to do FSDP over both the batch \textit{and} sequence axes, can we train LLaMA 3-70B with only FSDP on 8960 chips?
+\textbf{Question:} Now let's look at mixed tensor parallelism and FSDP. Does there exist some combination that lets us remain compute-bound? What amount of FSDP and tensor parallelism should we do if so?
+\begin{takeawaybox}
+We can train LLaMA-3 with a 4M token batch size on a full TPU v5p pod with a mixture of data parallelism (1024-way), sequence parallelism (2-way), and tensor parallelism (4-way) without being communication-bound. We will be comms-bound if we try to do pure FSDP or FSDP + sequence parallelism. The equations we've cooked up in the previous section are very practical.
+\end{takeawaybox}

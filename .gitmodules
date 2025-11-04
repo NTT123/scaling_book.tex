@@ -1,0 +1,3 @@
+[submodule "scaling-book"]
+	path = scaling-book
+	url = https://github.com/jax-ml/scaling-book.git

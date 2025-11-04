@@ -1,0 +1,82 @@
+\subsection{Tensor Parallelism}
+
+\textbf{Syntax:} $\text{In}[B, D_Y] \cdot_D W_\text{in}[D, F_Y] \cdot_F W_\text{out}[F_Y, D] \rightarrow \text{Out}[B, D_Y]$ (we use $Y$ to eventually combine with FSDP)
+
+In a fully-sharded data-parallel AllReduce we move the weights across chips. We can also shard the feedforward dimension of the model and move the activations during the layer~--- this is called ``1D model parallelism'' or Megatron sharding~\cite{megatron}. This can unlock a smaller efficient batch size per pod. The figure below shows an example of a single matrix sharded in this way:
+
+\begin{figure}[htb]
+    \centering
+    \includegraphics[width=\textwidth]{images/model-parallelism.png}
+    \caption{An example of basic tensor parallelism. Since we're only sharding our activations over Y (unlike in FSDP where we shard over X), we replicate our activations over X. Using our standard syntax, this is $\textbf{A}[B, D_Y] \times \textbf{B}[D, F_Y] \rightarrow \textbf{C}[B, F_Y]$. Because we're only sharding over one of the contracting dimensions, we typically AllGather the activations $\textbf{A}$ before the matmul.}
+    \label{fig:model-parallelism}
+\end{figure}
+
+As noted, $\textbf{In}[B, D_Y] \times_D W_{\text{in}}[D, F_Y] \times_F W_{\text{out}}[F_Y, D] \rightarrow \textbf{Out}[B, D_Y]$ means we have to gather our activations before the first matmul. This is cheaper than ZeRO sharding when the activations are smaller than the weights. This is typically true only with some amount of ZeRO sharding added (which reduces the size of the gather). This is one of the reasons we tend to mix ZeRO sharding and tensor parallelism.
+
+\begin{tcolorbox}[algorithmbox, title=Algorithm: Tensor Parallelism]
+
+\textbf{Forward pass:} need to compute Loss[B]
+
+\begin{enumerate}
+    \item In[B, D] = \textbf{AllGather}(In[B, D\textsubscript{Y}]) \textit{(on critical path)}
+    \item Tmp[B, F\textsubscript{Y}] = In[B, D] *\textsubscript{D} W\textsubscript{in}[D, F\textsubscript{Y}] \textit{(not sharded along contracting, so no comms)}
+    \item Out[B, D] \{U\textsubscript{Y}\} = Tmp[B, F\textsubscript{Y}] *\textsubscript{F} W\textsubscript{out}[F\textsubscript{Y}, D]
+    \item Out[B, D\textsubscript{Y}] = \textbf{ReduceScatter}(Out[B, D] \{U\textsubscript{Y}\}) \textit{(on critical path)}
+    \item Loss[B] = ...
+\end{enumerate}
+
+\textbf{Backward pass:} need to compute dW\textsubscript{out}[F\textsubscript{Y}, D], dW\textsubscript{in}[D, F\textsubscript{Y}]
+
+\begin{enumerate}
+    \item dOut[B, D\textsubscript{Y}] = ...
+    \item dOut[B, D] = \textbf{AllGather}(dOut[B, D\textsubscript{Y}]) \textit{(on critical path)}
+    \item dW\textsubscript{out}[F\textsubscript{Y}, D] = Tmp[B, F\textsubscript{Y}] *\textsubscript{B} dOut[B, D]
+    \item dTmp[B, F\textsubscript{Y}] = dOut[B, D] *\textsubscript{D} W\textsubscript{out}[F\textsubscript{Y}, D] \textit{(can throw away dOut[B, D] here)}
+    \item In[B, D] = \textbf{AllGather}(In[B, D\textsubscript{Y}]) \textit{(this can be skipped by sharing with (1) from the forward pass)}
+    \item dW\textsubscript{in}[D, F\textsubscript{Y}] = dTmp[B, F\textsubscript{Y}] *\textsubscript{B} In[B, D]
+    \item dIn[B, D] \{U.Y\} = dTmp[B, F\textsubscript{Y}] *\textsubscript{F} W\textsubscript{in}[D, F\textsubscript{Y}] \textit{(needed for previous layers)}
+    \item dIn[B, D\textsubscript{Y}] = \textbf{ReduceScatter}(dIn[B, D] \{U.Y\}) \textit{(on critical path)}
+\end{enumerate}
+
+\end{tcolorbox}
+
+One nice thing about tensor parallelism is that it interacts nicely with the two matrices in our Transformer forward pass. Naively, we would do an AllReduce after each of the two matrices. But here we first do $\textbf{In}[B, D_Y] \times W_{\text{in}}[D, F_Y] \rightarrow \textbf{Tmp}[B, F_Y]$ and then $\textbf{Tmp}[B, F_Y] \times W_{\text{out}}[F_Y, D] \rightarrow \textbf{Out}[B, D_Y]$. This means we AllGather $\textbf{In}$ at the beginning, and ReduceScatter $\textbf{Out}$ at the end, rather than doing an AllReduce.
+
+\textbf{How costly is this?} Let's only model the forward pass~- the backwards pass is just the transpose of each operation here. In 1D tensor parallelism we AllGather the activations before the first matmul, and ReduceScatter them after the second, sending two bytes at a time (bf16). Let's figure out when we're bottlenecked by communication.
+
+\begin{align}
+T_\text{math} & = \frac{4 \cdot B \cdot D \cdot F}{Y \cdot C} \\
+T_\text{comms} & =
+\frac{2 \cdot 2 \cdot (B \cdot D)}{W_\text{ici}}\\
+\textnormal{T} & \approx \max \left(\frac{4 \cdot B \cdot D \cdot F}{Y \cdot C}, \frac{2 \cdot 2 \cdot (B \cdot D)}{W_\text{ici}}\right)
+\end{align}
+
+Noting that we want compute cost to be greater than comms cost, we get:
+
+\begin{align}
+\frac{4 \cdot B \cdot D \cdot F}{Y \cdot C} > \frac{2 \cdot 2 \cdot (B \cdot D)}{W_\text{ici}}
+\end{align}
+
+\begin{align}
+\frac{F}{Y \cdot C} > \frac{1}{W_\text{ici}}
+\end{align}
+
+\begin{align}
+F > Y \cdot \frac{C}{W_\text{ici}}
+\end{align}
+
+Thus for instance, for TPUv5p, $C / W_{ici} = 2550$ in bf16, so we can only do tensor parallelism up to $Y < F / 2550$. When we have multiple ICI axes, our $T_\text{comms}$ is reduced by a factor of $M_Y$, so we get $Y < M_Y \cdot F / 2550$.
+
+\begin{tcolorbox}[takeawaybox]
+Tensor Parallelism becomes communication bound when $Y > M_Y \cdot F / 2550$. For most models this is between 8 and 16-way tensor parallelism.
+\end{tcolorbox}
+
+\textbf{Note that this doesn't depend on the precision of the computation}, since e.g.\ for int8, on TPUv5p, $C_\text{int8} / W_{ici}$ is $5100$ instead of $2550$ but the comms volume is also halved, so the two factors of two cancel.
+
+\textbf{Let's think about some examples:}
+
+\begin{itemize}
+    \item On TPUv5p with LLaMA 3-70B with $D = 8192,$ $F \approx 30,000$, we can comfortably do 8-way tensor parallelism, but will be communication bound on 16 way tensor parallelism. The required F for model 8 way model sharding is 20k.
+
+    \item For Gemma 7B, $F \approx 50k$, so we become communication bound with 19-way tensor parallelism. That means we could likely do 16-way and still see good performance.
+\end{itemize}

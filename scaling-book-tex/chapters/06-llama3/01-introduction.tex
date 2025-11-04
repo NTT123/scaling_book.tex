@@ -1,0 +1,41 @@
+\textit{Our goal in this section is to apply results from the previous section to a very practical problem: training the LLaMA 3 family (herd) of models. Unlike the previous sections we want you to do a lot of this work yourself. For this reason, we've hidden the answers to each section so you can try to answer it first. Try grabbing a pen and doing by hand!}
+
+\section{What does LLaMA 3 look like?}
+
+The LLaMA-3 model family~\cite{llama3} includes 3 main models: LLaMA 3 8B, 70B, and 405B. We'll mostly focus on 70B, and leave 8B and 405B for you to explore in the problem section at the end. Here's the architecture for LLaMA 3-70B, taken from the LLaMA \href{https://huggingface.co/meta-llama/Meta-Llama-3-70B/blob/main/config.json}{HuggingFace page}.
+
+{\scriptsize
+\begin{longtable}{p{5cm} p{3cm}}
+\toprule
+\textbf{hyperparam} & \textbf{value} \\
+\midrule
+\endfirsthead
+\toprule
+\textbf{hyperparam} & \textbf{value} \\
+\midrule
+\endhead
+\midrule
+\multicolumn{2}{r}{\textit{Continued on next page}} \\
+\endfoot
+\bottomrule
+\endlastfoot
+$n_\text{layers}$ (L) & 80 \\
+$d_\text{model}$ (D) & 8,192 \\
+$d_{ff}$ (F) & 28,672 \\
+$n_\text{heads}$ (N) & 64 \\
+$n_\text{kv\_heads}$ (K) & 8 \\
+$d_\text{qkv}$ (H) & 128 \\
+$n_\text{embeddings}$ (V) & 128,256 \\
+\end{longtable}
+}
+
+To highlight how easy this is to find, here's the config itself, along with a mapping:
+
+\begin{figure}[htb]
+\centering
+\includegraphics[width=\textwidth]{images/llama-json.png}
+\caption{LLaMA 3 configuration file showing the architecture parameters and their mapping to the hyperparameters listed above~.}
+\label{fig:llama-json}
+\end{figure}
+
+\textit{It's useful to make a big table with these numbers for many different open-source LLMs, so you can quickly compare the design decisions they've made.}

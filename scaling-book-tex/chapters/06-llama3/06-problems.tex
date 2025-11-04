@@ -1,0 +1,12 @@
+\section{Worked Problems}
+
+\begin{enumerate}
+    \item \textbf{Scaling LLaMA 70B to more chips:} Say we want to train LLaMA 3-70B on 4~pods with the same batch size. What parallelism scheme would we use? Would we be compute or communication bound? Roughly how long would it take to train? \textit{Make sure to use the correct roofline bound.}
+
+    \item \textbf{LLaMA 405B:}
+    \begin{enumerate}
+        \item[(a)] Using the LLaMA 3-405B config,\footnote{\url{https://huggingface.co/meta-llama/Llama-3.1-405B/blob/main/config.json}} write a table with all the key hyperparameters as above. How many total parameters does this model have? How many FLOPs per training step? How many FLOPs do we perform if we train for 15T~tokens?
+
+        \item[(b)] Assume we want to train on 8~TPU v5p pods. What parallelism scheme would we use? How long would training take? Would be compute or comms bound?
+    \end{enumerate}
+\end{enumerate}

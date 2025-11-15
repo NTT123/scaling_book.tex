@@ -131,7 +131,7 @@ $$S \gg T = 1 \implies \frac{ST}{S+T} \approx 1$$
 This is bad, since it means we cannot do anything to improve the arithmetic intensity of attention during generation. We're doing a tiny amount of FLOPs while loading a massive KV cache. \textbf{So we're basically always memory bandwidth-bound during attention!}
 
 \begin{takeawaybox}
-during prefill, attention is usually compute bound for any reasonable sequence length (roughly $> 480$ tokens) while during generation our arithmetic intensity is low and constant, so we are always memory bandwidth-bound.
+During prefill, attention is usually compute bound for any reasonable sequence length (roughly $> 480$ tokens) while during generation our arithmetic intensity is low and constant, so we are always memory bandwidth-bound.
 \end{takeawaybox}
 
 \textit{Why is this, conceptually?} Mainly, we're compute-bound in linear portions of the model because the parameters (the memory bandwidth-heavy components) are reused for many batch items. However, every batch item has its own KV cache, so a bigger batch size means more KV caches. We will almost \textit{always} be memory bound here unless the architecture is adjusted aggressively.
@@ -180,7 +180,7 @@ As you can see, there's a clear tradeoff between throughput and latency here. Sm
 Not only do we trade off latency and throughput with batch size as knob, we may also prefer a larger topology to a smaller one so we can fit larger batches if we find ourselves limited by HBM. The [next section](../applied-inference) explores this in more detail.
 
 \begin{takeawaybox}
-if you care about generation throughput, use the largest per-chip batch size possible. Any per-chip batch size above the TPU arithmetic intensity ($B_\text{crit}$~, usually 120 or 240) will maximize throughput. You may need to increase your topology to achieve this. Smaller batch sizes will allow you to improve latency at the cost of throughput.
+If you care about generation throughput, use the largest per-chip batch size possible. Any per-chip batch size above the TPU arithmetic intensity ($B_\text{crit}$~, usually 120 or 240) will maximize throughput. You may need to increase your topology to achieve this. Smaller batch sizes will allow you to improve latency at the cost of throughput.
 \end{takeawaybox}
 
 This is all quite theoretical. In practice we often don't quite see a sharp roofline for a few reasons:
@@ -308,7 +308,7 @@ Throughput (tok/s) & 239.94 & 1,429.19 & 2,212.48 & 3,047.62 & 3,756.62 & 4,529.
 \end{table}
 
 With a smaller KV cache, we still have diminishing returns, but the theoretical throughput per chip continues to scale up to batch size 240. We can fit a much bigger batch of 64, and latency is also consistently better at all batch sizes. The latency, maximum throughput, and maximum batch size all improve dramatically! In fact, later LLaMA generations used this exact optimization---LLaMA-3 8B has 32 query heads and 8 KV heads (\href{https://huggingface.co/MaziyarPanahi/Llama-3-13B-Instruct-v0.1/blob/dfdeb40bdb2c149dfa399ea2be0d56eb120f0831/config.json}{source}).
-
+\newpage
 \begin{takeawaybox}
 In addition to params, the size of KV cache has a lot of bearing over the ultimate inference performance of the model. We want to keep it under control with a combination of architectural decisions and runtime optimizations.
 \end{takeawaybox}

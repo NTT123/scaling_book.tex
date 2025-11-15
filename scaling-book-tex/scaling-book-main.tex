@@ -5,13 +5,13 @@
 \usepackage{fontsetup}
 
 % B6 paper size with two-sided margins
-% Using tighter margins to accommodate wide tables and math
+% Using balanced margins to avoid overflow feeling
 \usepackage[
     b6paper,
     inner=1.6cm,      % Binding side margin (more space for binding)
-    outer=0.8cm,    % Outer edge margin (reduced for more text width)
-    top=0cm,        % No top margin for maximum content space
-    bottom=0.4cm,   % Minimal bottom margin for page numbers
+    outer=0.8cm,      % Outer edge margin (reduced for more text width)
+    top=0.2cm,        % Top margin for breathing room
+    bottom=1.0cm,     % Bottom margin for breathing room
     includeheadfoot
 ]{geometry}
 
@@ -173,14 +173,18 @@
 % Chapter and section formatting
 \usepackage{titlesec}
 \titleformat{\chapter}[display]
-  {\normalfont\huge\bfseries}{\chaptertitlename\ \thechapter}{20pt}{\Huge}
-\titlespacing*{\chapter}{0pt}{-20pt}{40pt}
+  {\normalfont\sffamily\huge\bfseries}{\chaptertitlename\ \thechapter}{20pt}{\Huge}
+\titlespacing*{\chapter}{0pt}{50pt}{40pt}
+\titleformat{\section}
+  {\normalfont\sffamily\Large\bfseries}{\thesection}{1em}{}
+\titleformat{\subsection}
+  {\normalfont\sffamily\large\bfseries}{\thesubsection}{1em}{}
 
 % Page headers and footers - simple page numbers in footer only
 \usepackage{fancyhdr}
 \pagestyle{fancy}
 \fancyhf{} % Clear all headers and footers
-\fancyfoot[C]{\thepage} % Center page number in footer
+\fancyfoot[C]{\small\rmfamily\thepage} % Center page number in footer with smaller Roman font
 \renewcommand{\headrulewidth}{0pt} % Remove header line
 \renewcommand{\footrulewidth}{0pt} % No footer line
 

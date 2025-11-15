@@ -15,7 +15,7 @@ From a roofline standpoint, \textbf{prefill is almost identical to training} and
 
 
 \begin{takeawaybox}
-during prefill, almost any sharding that can work during training can work fine. Do model parallelism up to the ICI bound, then do sequence parallelism.
+During prefill, almost any sharding that can work during training can work fine. Do model parallelism up to the ICI bound, then do sequence parallelism.
 \end{takeawaybox}
 
 
@@ -51,7 +51,7 @@ For the attention layer, we also model shard attention $W_Q$~ and $W_O$~ over he
 
 
 \begin{takeawaybox}
-our only options during generation are variants of model parallelism. We aim to move activations instead of KV caches or parameters, which are larger. When our batch size is large, we do model parallelism up to the FLOPs-ICI bound ($F / \alpha$). When our batch size is smaller, we can improve latency by model sharding more (at a modest throughput cost). When we want to model shard more ways than we have KV heads, we can shard our KVs along the batch dimension as well.
+Our only options during generation are variants of model parallelism. We aim to move activations instead of KV caches or parameters, which are larger. When our batch size is large, we do model parallelism up to the FLOPs-ICI bound ($F / \alpha$). When our batch size is smaller, we can improve latency by model sharding more (at a modest throughput cost). When we want to model shard more ways than we have KV heads, we can shard our KVs along the batch dimension as well.
 \end{takeawaybox}
 
 

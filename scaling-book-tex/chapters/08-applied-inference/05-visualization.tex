@@ -29,6 +29,6 @@ We can understand this better by breaking down the sources of cost and latency i
 This tells quite a story. You can see that initially, parameter loading represents the vast majority of the latency, until the batch size becomes large enough that FLOPs and KV loading become more significant. Notably, at all sequence lengths greater than 2048, we spend more time on KV cache loading than we do on FLOPs! \textbf{So while we can improve our hardware utilization by increasing batch size, at long context lengths KV loading always dominates the total step time.}
 
 \begin{takeawaybox}
-\textbf{Takeaway:} for LLaMA 3-70B, we are strongly KV cache memory bandwidth-bound (and HBM-bound) in almost all of these configurations, highlighting just how important reducing KV cache size is for generation throughput. Also note just how dramatic the latency/throughput tradeoff remains here.
+For LLaMA 3-70B, we are strongly KV cache memory bandwidth-bound (and HBM-bound) in almost all of these configurations, highlighting just how important reducing KV cache size is for generation throughput. Also note just how dramatic the latency/throughput tradeoff remains here.
 \end{takeawaybox}
 

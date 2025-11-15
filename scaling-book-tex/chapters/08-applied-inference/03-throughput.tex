@@ -15,7 +15,7 @@ Let's spend a little time thinking purely about throughput. When we optimize for
 \vspace{1em}
 
 \begin{takeawaybox}
-\textbf{Takeaway}: we can always lower bound decode latency by asking how long it takes to load all the model's parameters from HBM into the MXU. When our KV caches are small, you can think about each layer as just loading the weights chunk-by-chunk and then discarding them. Unless we're using large batch sizes or lots of inter-device comms, this is often a reasonable bound (within 1.5x). When our batch size is bigger, we need to model the KV cache loading as well, since that dominates the parameters.
+We can always lower bound decode latency by asking how long it takes to load all the model's parameters from HBM into the MXU. When our KV caches are small, you can think about each layer as just loading the weights chunk-by-chunk and then discarding them. Unless we're using large batch sizes or lots of inter-device comms, this is often a reasonable bound (within 1.5x). When our batch size is bigger, we need to model the KV cache loading as well, since that dominates the parameters.
 \end{takeawaybox}
 
 Likewise, in the FLOPs-bound regime (e.g. training or big-batch inference), we can use the $\text{Total FLOPs} / (N \cdot C) = 2 \cdot \text{param count} \cdot B / (N \cdot C)$ lower bound, which assumes no communication.
@@ -35,5 +35,5 @@ Likewise, in the FLOPs-bound regime (e.g. training or big-batch inference), we c
 \vspace{1em}
 
 \begin{takeawaybox}
-\textbf{Tip}: the maximum amount of useful model parallelism depends on $d_{ff}$ and the number of axes over which you're sharding your model. The maximum value usually ranges between 8 and 32 depending on the model size. You can scale beyond this limit to improve latency at some throughput cost.
+The maximum amount of useful model parallelism depends on $d_{ff}$ and the number of axes over which you're sharding your model. The maximum value usually ranges between 8 and 32 depending on the model size. You can scale beyond this limit to improve latency at some throughput cost.
 \end{takeawaybox}

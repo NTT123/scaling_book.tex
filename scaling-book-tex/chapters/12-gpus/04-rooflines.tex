@@ -73,7 +73,7 @@ $$T_\text{comms} = \frac{2 \cdot 2 \cdot 2 \cdot DF \cdot (X-1)}{X \cdot W_\text
 where X is the number of nodes and $N = 8 \cdot X$. Then for a dense model we have $B / N > \alpha \cdot (X - 1) / X$, or e.g. $B / N > \text{1237}$, half the above value. You'll notice 2-way data parallelism fairly often for this reason.
 
 \begin{takeawaybox}
-\textbf{Takeaway:} Data parallelism and ZeRO sharding require a per-device batch size of about 2500 tokens to be compute-bound on an H100 or B200, assuming perfect overlap and FLOPs utilization. For MoE models, this increases by a factor of $E / k$, the ratio of total to activated parameters. When doing a small amount of data parallelism, the critical batch size decreases.
+Data parallelism and ZeRO sharding require a per-device batch size of about 2500 tokens to be compute-bound on an H100 or B200, assuming perfect overlap and FLOPs utilization. For MoE models, this increases by a factor of $E / k$, the ratio of total to activated parameters. When doing a small amount of data parallelism, the critical batch size decreases.
 \end{takeawaybox}
 
 \subsection{Tensor Parallelism}
@@ -91,7 +91,7 @@ $$Y < \frac{F \cdot W_\text{collective}}{C}$$
 Within a node, this gives us about $F / 2200$ or $F / 2475$ beyond a node. For $F=\text{28000}$ like LLaMA-3, this is about 11-way TP (or rounding down, about 8-way, which is how large a node is). As with above, we get an extra 2X bandwidth when we span exactly 2 nodes, so we can generally do 16-way tensor parallelism ($F > 2475 \cdot (Y - 8)$), which gives us up to 19-way model parallelism in theory.
 
 \begin{takeawaybox}
-\textbf{Takeaway:} Tensor parallelism over an axis of size Y with feed-forward dimension F becomes bandwidth-bound when the $Y > F / 2475$, which generally constrains us to only intra-node TP or at most 2-node TP.
+Tensor parallelism over an axis of size Y with feed-forward dimension F becomes bandwidth-bound when the $Y > F / 2475$, which generally constrains us to only intra-node TP or at most 2-node TP.
 \end{takeawaybox}
 
 \subsection{Expert Parallelism}
@@ -109,7 +109,7 @@ We either need $K > Z/8$ with $F > \alpha \cdot (Z - 8)/k$ or $Z \gg K$ and $F >
 You'll see both cases in practice, either a small amount of expert-parallelism (like DeepSeek v3 which has very small F and relatively small, restricted cross-node expert parallelism), or models with large F, in which case we can do significant cross-node EP alongside TP.
 
 \begin{takeawaybox}
-\textbf{Takeaway:} if $F < 8 * C / W_\text{node}$, expert parallelism can span 1-2 nodes with similar (slightly lower) cost to TP, or if $F > 8 * C / W_\text{node}$, we can do a significant amount of expert parallelism (up to $E$ nodes) with relatively low cost.
+If $F < 8 * C / W_\text{node}$, expert parallelism can span 1-2 nodes with similar (slightly lower) cost to TP, or if $F > 8 * C / W_\text{node}$, we can do a significant amount of expert parallelism (up to $E$ nodes) with relatively low cost.
 \end{takeawaybox}
 
 \subsection{Pipeline Parallelism}

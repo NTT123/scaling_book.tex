@@ -94,7 +94,7 @@ By comparison, a TPU v5p has about 90GB/s egress bandwidth per link, or 540GB/s 
 The GPU switching fabric can in theory be extended to arbitrary sizes by adding additional switches or layers of indirection, at the cost of additional latency and costly network switches.
 
 \begin{takeawaybox}
-\textbf{Takeaway}: Within an H100 node, we have a full fat tree bandwidth of 450GB/s from each GPU, while beyond the node, this drops to 400GB/s node-to-node. This will turn out to be critical for communication primitives.
+Within an H100 node, we have a full fat tree bandwidth of 450GB/s from each GPU, while beyond the node, this drops to 400GB/s node-to-node. This will turn out to be critical for communication primitives.
 \end{takeawaybox}
 
 \textbf{GB200 NVL72s:} NVIDIA has recently begun producing new GB200 NVL72 GPU clusters that combine 72 GPUs in a single NVLink domain with full 900GB/s of GPU to GPU bandwidth. These domains can then be linked into larger SuperPods with proportionally higher (9x) IB fat tree bandwidth. Here is a diagram of that topology:
@@ -126,7 +126,7 @@ GB200 NVL72 & 72 & 900 & 3600 \\
 \end{table}
 
 \begin{takeawaybox}
-\textbf{Takeaway}: GB200 NVL72 SuperPods drastically increase the node size and egress bandwidth from a given node, which changes our rooflines significantly.
+GB200 NVL72 SuperPods drastically increase the node size and egress bandwidth from a given node, which changes our rooflines significantly.
 \end{takeawaybox}
 
 \subsection{Quiz 3: Beyond the node level}
